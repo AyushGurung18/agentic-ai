@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: copilot_api
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_URL=http://172.17.0.1:11434/api/generate
+      - WATCHPACK_POLLING=true
+      - CHOKIDAR_USEPOLLING=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app # Hot-reloading
+
+  # ── Celery Worker — background PDF ingestion ────────────────────────────────
+  worker:
+    build: .
+    container_name: copilot_worker
+    command: >
+      celery -A app.worker.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=celery
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_URL=http://172.17.0.1:11434/api/generate
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+    # Worker depends on the API service only for shared code — not for HTTP.
+    # It connects to CloudAMQP directly via CLOUDAMQP_URL in .env.
+    depends_on:
+      - api

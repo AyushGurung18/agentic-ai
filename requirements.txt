@@ -1,0 +1,53 @@
+fastapi[all]
+uvicorn
+pymupdf4llm
+requests
+
+# Vector / embeddings
+faiss-cpu
+sentence-transformers
+
+# LangChain ecosystem
+langchain
+langchain-community>=0.2.0
+langchain-postgres
+langchain-huggingface
+langchain-ollama
+langchain-groq
+langchain-text-splitters
+langchain-classic==1.0.4
+langchain-core
+
+# LangGraph (Self-RAG + CRAG)
+langgraph>=0.2.0
+
+# Database
+psycopg2-binary
+psycopg[binary]
+psycopg-pool
+SQLAlchemy
+
+# Celery + RabbitMQ (CloudAMQP)
+celery>=5.3.0
+kombu>=5.3.0
+
+# CRAG web search tools
+duckduckgo-search>=6.0.0
+tavily-python                   # optional — set TAVILY_API_KEY to activate
+
+# New RAG Features (Models, Evals, SSE, Reranking)
+langchain-google-genai
+langchain-nvidia-ai-endpoints
+sse-starlette
+ragas
+sentence-transformers
+FlashRank
+langsmith
+
+# Auth / validation
+pydantic>=2.0.0
+python-dotenv
+python-jose[cryptography]
+
+# Storage
+boto3>=1.28.0
