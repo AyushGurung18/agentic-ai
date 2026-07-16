@@ -55,8 +55,10 @@ def health():
 
 # ── Upload (async — dispatches to Celery worker) ─────────────────────────────
 
-from app.services.storage import upload_file_stream_to_r2
+from app.services.storage import upload_file_stream_to_r2, delete_file_from_r2
 from app.worker.tasks import ingest_document_task
+
+MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — keep in sync with the frontend's client-side check
 
 
 class UploadJobResponse(BaseModel):
@@ -97,7 +99,7 @@ async def upload(
     The extracted text string is then handed to Celery, which does chunking +
     embedding in the worker process — keeping the API process lightweight.
     """
-    if not file.filename.endswith(".pdf"):
+    if not file.filename or not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     # Ensure the user row exists (idempotent upsert)
@@ -108,7 +110,14 @@ async def upload(
         # ── Read the entire upload once into memory ──────────────────────────
         # This guarantees both R2 upload and text extraction see the full bytes
         # without any disk writes — critical for HF Space containers.
-        raw_bytes = await file.read()
+        # Read one byte past the cap so an oversized file is rejected cleanly
+        # instead of being fully buffered into memory first.
+        raw_bytes = await file.read(MAX_UPLOAD_SIZE_BYTES + 1)
+        if len(raw_bytes) > MAX_UPLOAD_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds the {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB upload limit.",
+            )
         pdf_buffer = _io.BytesIO(raw_bytes)
 
         # 1. Upload the raw PDF to R2 for storage
@@ -126,16 +135,22 @@ async def upload(
 
         # 3. Create a document_jobs row (status=pending)
         job_id = str(_uuid.uuid4())
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO document_jobs (id, user_id, filename, r2_url, status)
-                    VALUES (%s::uuid, %s::uuid, %s, %s, 'pending')
-                    """,
-                    (job_id, user_id, file.filename, r2_url),
-                )
-            conn.commit()
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO document_jobs (id, user_id, filename, r2_url, status)
+                        VALUES (%s::uuid, %s::uuid, %s, %s, 'pending')
+                        """,
+                        (job_id, user_id, file.filename, r2_url),
+                    )
+                conn.commit()
+        except Exception:
+            # The R2 object is already durably stored — if the DB row never
+            # gets created, delete it rather than leaving it orphaned.
+            delete_file_from_r2(r2_url)
+            raise
 
         # 4. Dispatch Celery task — returns immediately
         ingest_document_task.delay(
