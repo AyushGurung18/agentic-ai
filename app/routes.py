@@ -87,6 +87,15 @@ async def upload(
 
     Returns immediately with a job_id.  Large PDFs (100 pages) are chunked
     and embedded asynchronously — poll GET /upload/status/{job_id} for progress.
+
+    In-memory strategy
+    ──────────────────
+    The raw PDF bytes are read once into a BytesIO buffer in the API process.
+    That same buffer (seeked back to 0 between uses) is passed to:
+      1. R2 upload  — stores the original PDF for durable retrieval
+      2. extract_text() — parses text with fitz entirely in-memory (no disk I/O)
+    The extracted text string is then handed to Celery, which does chunking +
+    embedding in the worker process — keeping the API process lightweight.
     """
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
@@ -95,14 +104,23 @@ async def upload(
     ensure_user(user_id, email=f"anon-{user_id}@thotqen.internal")
 
     try:
+        import io as _io
+        # ── Read the entire upload once into memory ──────────────────────────
+        # This guarantees both R2 upload and text extraction see the full bytes
+        # without any disk writes — critical for HF Space containers.
+        raw_bytes = await file.read()
+        pdf_buffer = _io.BytesIO(raw_bytes)
+
         # 1. Upload the raw PDF to R2 for storage
         try:
-            r2_url = upload_file_stream_to_r2(file.file, file.filename)
+            pdf_buffer.seek(0)
+            r2_url = upload_file_stream_to_r2(pdf_buffer, file.filename)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to upload to R2: {str(e)}")
 
         # 2. Extract text in-process (fast; just PDF parsing, not embedding)
-        text = extract_text(file.file)
+        pdf_buffer.seek(0)
+        text = extract_text(pdf_buffer)
         if not text.strip():
             raise HTTPException(status_code=422, detail="PDF appears to be empty or unreadable.")
 

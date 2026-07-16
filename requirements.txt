@@ -3,6 +3,9 @@ uvicorn
 pymupdf4llm
 requests
 
+# Supervisor (multi-process manager for HF Space)
+supervisor
+
 # Vector / embeddings
 faiss-cpu
 sentence-transformers
@@ -40,14 +43,15 @@ langchain-google-genai
 langchain-nvidia-ai-endpoints
 sse-starlette
 ragas
-sentence-transformers
 FlashRank
 langsmith
 
 # Auth / validation
 pydantic>=2.0.0
+python-multipart
 python-dotenv
 python-jose[cryptography]
 
 # Storage
 boto3>=1.28.0
+supabase

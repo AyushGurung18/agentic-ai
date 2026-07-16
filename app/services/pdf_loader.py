@@ -1,20 +1,42 @@
-import tempfile
-import os
-import pymupdf4llm
+"""
+app/services/pdf_loader.py
+──────────────────────────
+Extracts plain text from a PDF file-like object entirely in memory.
 
-def extract_text(file):
-    # 'file' is a SpooledTemporaryFile from FastAPI UploadFile
-    # We need to save it to disk temporarily because pymupdf4llm needs a filename
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(file.read())
-        tmp_file_path = tmp_file.name
+Why in-memory?
+  • HF Spaces containers run with a read-only filesystem outside /tmp and /data.
+  • Writing temp files risks exceeding ephemeral storage or leaving orphans.
+  • pymupdf (fitz) supports opening PDFs from a bytes buffer directly, so we
+    never touch the disk at all.
+"""
 
-    try:
-        # Generate markdown from the PDF using pymupdf4llm
-        md_text = pymupdf4llm.to_markdown(tmp_file_path)
-        print(md_text)
-        return md_text
-    finally:
-        # Ensure we always clean up the temporary file
-        if os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
+import io
+import fitz  # PyMuPDF — fast, pure C, no external dependencies
+
+
+def extract_text(file) -> str:
+    """
+    Extract markdown-formatted text from a PDF file-like object (in-memory).
+
+    Parameters
+    ----------
+    file : file-like object
+        A SpooledTemporaryFile, BytesIO, or any readable binary stream.
+
+    Returns
+    -------
+    str
+        Extracted text content from all pages joined as a single string.
+    """
+    # Read the entire binary content into memory
+    raw_bytes = file.read() if not isinstance(file, (bytes, bytearray)) else file
+
+    # Open from a bytes buffer — no disk write
+    doc = fitz.open(stream=raw_bytes, filetype="pdf")
+
+    pages_text = []
+    for page in doc:
+        pages_text.append(page.get_text("text"))
+
+    doc.close()
+    return "\n\n".join(pages_text)

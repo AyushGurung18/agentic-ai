@@ -23,7 +23,7 @@ def get_r2_client():
 def upload_file_stream_to_r2(file_obj, filename: str, content_type: str = "application/pdf") -> str:
     """Uploads a file-like object to R2 and returns the public URL."""
     client = get_r2_client()
-    bucket_name = os.getenv("R2_BUCKET_NAME", "thotqen-docs")
+    bucket_name = os.getenv("R2_BUCKET_NAME", "user-documents-prod")
     
     # Generate unique object key
     unique_id = str(uuid.uuid4())
