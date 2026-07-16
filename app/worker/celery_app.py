@@ -55,6 +55,19 @@ celery_app.conf.update(
     accept_content=["json"],
     result_serializer="json",
 
+    # ── CloudAMQP Free-Tier connection budget (hard cap: 20 connections) ────────
+    # 1 pool slot for publisher (API process) + 1 for worker = 2 total.
+    # Without this, Celery opens a pool of connections per process and
+    # blows past the 20-connection limit within minutes.
+    broker_pool_limit=1,
+
+    # These three flags stop the worker from opening extra control-plane
+    # connections for gossip (peer discovery), mingle (state sync), and
+    # heartbeat (liveness pings). On CloudAMQP Free, every connection counts.
+    worker_gossip=False,
+    worker_mingle=False,
+    # heartbeat is disabled via CLI --without-heartbeat in supervisord.conf
+
     # Reliability
     task_acks_late=True,
     worker_prefetch_multiplier=1,

@@ -1,34 +1,39 @@
-# Dockerfile – Production image for Hugging Face Spaces (UID 1000, port 7860)
-# ---------------------------------------------------------------
-# Base image – lightweight Python 3.11 slim
+# ── Dockerfile ────────────────────────────────────────────────────────────────
+# Production image for Hugging Face Spaces (UID 1000, port 7860)
+# Multi-process: supervisord manages FastAPI (uvicorn) + Celery worker.
+# ─────────────────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# ---- Python runtime optimizations -------------------------------------------------
+# ── Python runtime optimisations ──────────────────────────────────────────────
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# ---- System dependencies (pgvector needs libpq-dev) -----------------------------
+# ── System dependencies ───────────────────────────────────────────────────────
+# libpq-dev + gcc  → psycopg / psycopg2 build
+# supervisor       → installed via pip, but needs system Python path
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq-dev gcc python3-dev postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- Create non‑root user required by Hugging Face Spaces ------------------------
+# ── Non-root user (required by HF Spaces) ─────────────────────────────────────
 RUN useradd -m -u 1000 user
 USER user
 ENV PATH="/home/user/.local/bin:$PATH"
 
-# ---- Working directory ------------------------------------------------------------
+# ── Working directory ──────────────────────────────────────────────────────────
 WORKDIR /code
 
-# ---- Install Python dependencies – leverage pip cache layer -----------------------
+# ── Python dependencies ────────────────────────────────────────────────────────
+# Installed in a separate layer so Docker caches them even if source changes.
 COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Copy application source ------------------------------------------------------
+# ── Application source + supervisord config ────────────────────────────────────
 COPY --chown=user . .
 
-# ---- Expose the default HF port --------------------------------------------------
+# ── Port ──────────────────────────────────────────────────────────────────────
 EXPOSE 7860
 
-# ---- Entrypoint – run FastAPI via uvicorn on 0.0.0.0:7860 ---------------------
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+# supervisord is PID 1; it launches both FastAPI and Celery as child processes.
+CMD ["supervisord", "-c", "/code/supervisord.conf"]
