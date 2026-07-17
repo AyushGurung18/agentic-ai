@@ -3,7 +3,7 @@ app/services/rag.py
 ────────────────────
 Conversational RAG entry points wired to:
   • LangGraph Self-RAG + CRAG graph  (langgraph_rag.py)
-  • Groq / Ollama LLMs
+  • Groq / Gemini / NVIDIA / self-hosted vLLM LLMs
   • PGVector + HNSW for similarity retrieval
   • Normalized messages table for chat history  (via history.py)
   • Normalized documents / chunks / embeddings tables (via document_service.py)
@@ -19,7 +19,7 @@ import logging
 import httpx
 import threading
 
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -36,7 +36,7 @@ from app.services.langgraph_rag import run_rag_graph
 from app.services.embeddings import embed_text
 from app.core.config import (
     CHUNK_SIZE, CHUNK_OVERLAP,
-    OLLAMA_MODEL, OLLAMA_URL,
+    VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY,
     GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY,
     DEV_USER_ID, DEV_USER_EMAIL,
 )
@@ -106,27 +106,48 @@ def route_intent(question: str) -> str:
         logger.warning(f"Intent router failed: {e}. Defaulting to 'complex'.")
         return "complex"
 
+def _get_vllm_llm(temperature: float) -> ChatOpenAI:
+    """Self-hosted fallback — talks to a vLLM OpenAI-compatible server.
+
+    vLLM's PagedAttention KV-cache manager is what makes this a viable
+    no-cloud-API-key fallback under concurrent requests, unlike a naive
+    single-request local model server.
+    """
+    return ChatOpenAI(
+        model=VLLM_MODEL,
+        base_url=VLLM_BASE_URL,
+        api_key=VLLM_API_KEY,
+        temperature=temperature,
+    )
+
+
 def get_llm_by_intent(intent: str):
     """Returns an instantiated LLM based on intent."""
     if intent == "cheap":
-        # Prefer Gemini Flash, fallback to Groq Llama 3.1 8B
+        # Prefer Gemini Flash, then Groq Llama 3.1 8B, then self-hosted vLLM
         if GEMINI_API_KEY:
             logger.info("🤖 Routing [CHEAP] -> Gemini 1.5 Flash")
             return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.1)
-        else:
+        elif GROQ_API_KEY:
             logger.info("🤖 Routing [CHEAP] -> Groq Llama 3.1 8B")
             return ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1, groq_api_key=GROQ_API_KEY)
+        else:
+            logger.info("🤖 Routing [CHEAP] -> Self-hosted vLLM (%s)", VLLM_MODEL)
+            return _get_vllm_llm(temperature=0.1)
     else:
-        # Prefer Nvidia (Llama 70B), fallback to Gemini Pro or Groq 70B
+        # Prefer Nvidia (Llama 70B), then Gemini Pro, then Groq 70B, then self-hosted vLLM
         if NVIDIA_API_KEY:
             logger.info("🤖 Routing [COMPLEX] -> Nvidia (meta/llama-3.1-70b-instruct)")
             return ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=0.2)
         elif GEMINI_API_KEY:
             logger.info("🤖 Routing [COMPLEX] -> Gemini 1.5 Pro")
             return ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
-        else:
+        elif GROQ_API_KEY:
             logger.info("🤖 Routing [COMPLEX] -> Groq Llama 3.3 70B")
             return ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=GROQ_API_KEY)
+        else:
+            logger.info("🤖 Routing [COMPLEX] -> Self-hosted vLLM (%s)", VLLM_MODEL)
+            return _get_vllm_llm(temperature=0.2)
 
 
 # ── Document ingestion (unchanged — also called by Celery worker) ──────────────

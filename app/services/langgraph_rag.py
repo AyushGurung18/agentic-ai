@@ -18,7 +18,7 @@ Graph topology
   retrieve                (Hybrid Search: BM25 + Vector → RRF, parent-child)
     │
     ▼
-  rerank_documents        (Cross-Encoder reranker, keep top-5)
+  rerank_documents        (BGE cross-encoder reranker, keep top-5)
     │
     ▼
   grade_documents         (LLM grades each doc for relevance)
@@ -38,7 +38,7 @@ Nodes
   input_guardrail   LLM safety check; blocks prompt injection / toxic content
   hyde_generator    Generates a hypothetical answer to enrich the query embedding
   retrieve          Hybrid Search (RRF = BM25 + vector) + Parent chunk expansion
-  rerank_documents  Cross-Encoder reranker (ms-marco-MiniLM) keeps top-5
+  rerank_documents  BGE cross-encoder reranker (bge-reranker-base) keeps top-5
   grade_documents   LLM grades each doc as "yes" (relevant) or "no"
   rewrite_query     LLM rewrites question to improve retrieval
   web_search        DuckDuckGo (or Tavily if TAVILY_API_KEY set) — CRAG fallback
@@ -92,8 +92,8 @@ cross_encoder = None
 def get_reranker():
     global cross_encoder
     if cross_encoder is None:
-        logger.info("[reranker] Loading CrossEncoder...")
-        cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        logger.info("[reranker] Loading BGE reranker...")
+        cross_encoder = CrossEncoder('BAAI/bge-reranker-base')
     return cross_encoder
 
 
