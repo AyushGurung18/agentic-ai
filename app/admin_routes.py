@@ -21,7 +21,7 @@ def get_langsmith_metrics():
         # Fetch the most recent 50 root runs (traces) for this project
         runs = list(client.list_runs(
             project_name=project_name,
-            execution_order=1, # Only get the top-level trace, not every inner step
+            is_root=True,  # Only get the top-level trace, not every inner step
             limit=50
         ))
         
