@@ -15,7 +15,7 @@ langchain
 langchain-community>=0.2.0
 langchain-postgres
 langchain-huggingface
-langchain-ollama
+langchain-openai
 langchain-groq
 langchain-text-splitters
 langchain-classic==1.0.4

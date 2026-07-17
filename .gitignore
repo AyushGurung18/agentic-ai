@@ -1,4 +1,5 @@
 .env
+env
 app/services/__pycache__
 __pycache__/
 *.pyc

@@ -7,8 +7,13 @@ CHUNK_SIZE    = 500
 CHUNK_OVERLAP = 100
 TOP_K         = 3
 
-OLLAMA_URL   = os.environ.get("OLLAMA_URL",  "http://localhost:11434/api/generate")
-OLLAMA_MODEL = "resume-brain"
+# ── Self-hosted inference (vLLM, OpenAI-compatible server) ───────────────────
+# Used as the no-API-key-needed fallback when no cloud provider key is set.
+# vLLM's PagedAttention KV-cache manager is what makes this serving path
+# viable for concurrent requests without per-request GPU memory blowup.
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8001/v1")
+VLLM_MODEL    = os.environ.get("VLLM_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+VLLM_API_KEY  = os.environ.get("VLLM_API_KEY", "not-needed")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
