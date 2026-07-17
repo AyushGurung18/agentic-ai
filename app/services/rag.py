@@ -25,6 +25,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langsmith import traceable
 import langchain
 langchain.debug = False  # set True only when actively debugging chains
 
@@ -83,6 +84,7 @@ def _write_to_semantic_cache(question: str, answer: str) -> None:
 
 # ── Intent Router & LLM factory ────────────────────────────────────────────────
 
+@traceable(name="route_intent", run_type="chain")
 def route_intent(question: str) -> str:
     """Classifies user intent as 'cheap' or 'complex' using a fast, cheap model."""
     try:
