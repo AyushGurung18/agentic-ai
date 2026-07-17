@@ -23,6 +23,7 @@ langchain-core
 
 # LangGraph (Self-RAG + CRAG)
 langgraph>=0.2.0
+tenacity>=8.2.0
 
 # Database
 psycopg2-binary
@@ -43,6 +44,7 @@ langchain-google-genai
 langchain-nvidia-ai-endpoints
 sse-starlette
 ragas
+rapidfuzz
 FlashRank
 langsmith
 

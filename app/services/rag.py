@@ -32,7 +32,7 @@ from app.services.chunking import hierarchical_chunk_text
 from app.services.vectorstore import VectorStore
 from app.services.document_service import ingest_document, ensure_session, ensure_user
 from app.services.hf_cache import append_messages_to_cache
-from app.services.langgraph_rag import run_rag_graph
+from app.services.langgraph_rag import run_rag_graph, invoke_with_retry
 from app.services.embeddings import embed_text
 from app.core.config import (
     CHUNK_SIZE, CHUNK_OVERLAP,
@@ -98,7 +98,7 @@ def route_intent(question: str) -> str:
         ])
         
         chain = prompt | router_llm | StrOutputParser()
-        intent = chain.invoke({"question": question[:500]}).strip().lower()
+        intent = invoke_with_retry(chain, {"question": question[:500]}).strip().lower()
         if intent not in ["cheap", "complex"]:
             intent = "complex"
         return intent
@@ -127,7 +127,7 @@ def get_llm_by_intent(intent: str):
         # Prefer Gemini Flash, then Groq Llama 3.1 8B, then self-hosted vLLM
         if GEMINI_API_KEY:
             logger.info("🤖 Routing [CHEAP] -> Gemini 1.5 Flash")
-            return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.1)
+            return ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.1)
         elif GROQ_API_KEY:
             logger.info("🤖 Routing [CHEAP] -> Groq Llama 3.1 8B")
             return ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1, groq_api_key=GROQ_API_KEY)
@@ -141,7 +141,7 @@ def get_llm_by_intent(intent: str):
             return ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=0.2)
         elif GEMINI_API_KEY:
             logger.info("🤖 Routing [COMPLEX] -> Gemini 1.5 Pro")
-            return ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
+            return ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
         elif GROQ_API_KEY:
             logger.info("🤖 Routing [COMPLEX] -> Groq Llama 3.3 70B")
             return ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=GROQ_API_KEY)

@@ -10,11 +10,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from ragas.testset.generator import TestsetGenerator
-from ragas.testset.evolutions import simple, reasoning, multi_context
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from ragas.testset import TestsetGenerator
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.run_config import RunConfig
 
 from app.db.database import get_conn
+from app.services.embeddings import embeddings as local_embeddings
+from app.core.config import NVIDIA_API_KEY
 
 def fetch_document_chunks(limit=20):
     """Fetch parent chunks from the DB to generate questions from."""
@@ -45,53 +49,39 @@ def fetch_document_chunks(limit=20):
 
 def generate_testset():
     print("Fetching documents from database...")
-    docs = fetch_document_chunks(limit=30)
-    
+    docs = fetch_document_chunks(limit=12)
+
     if not docs:
         print("No parent chunks found in database. Please upload a PDF first.")
         return
-        
+
     print(f"Loaded {len(docs)} documents. Initializing Ragas TestsetGenerator...")
-    
-    # We use Gemini 1.5 Flash for fast/cheap testset generation.
-    # For higher quality questions, swap this to Llama 70B or Gemini Pro.
-    generator_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.7)
-    critic_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    
-    generator = TestsetGenerator.from_langchain(
-        generator_llm=generator_llm,
-        critic_llm=critic_llm,
-        embeddings=embeddings
-    )
-    
-    # Define what types of questions we want
-    distributions = {
-        simple: 0.5,
-        reasoning: 0.25,
-        multi_context: 0.25
-    }
-    
-    test_size = 10
-    print(f"Generating {test_size} synthetic Q&A pairs (this may take a few minutes)...")
-    
-    testset = generator.generate_with_langchain_docs(
-        docs, 
-        test_size=test_size, 
-        distributions=distributions,
-        # set is_async to False if running into rate limits
-        is_async=True
-    )
-    
+
+    # NVIDIA-hosted Llama 3.1 70B for testset generation — avoids Gemini's
+    # restrictive free-tier quota (20 req/day) and Groq's account restriction.
+    # Embeddings reuse the project's own local MiniLM model.
+    generator_llm = LangchainLLMWrapper(ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=0.7))
+    generator_embeddings = LangchainEmbeddingsWrapper(local_embeddings)
+
+    generator = TestsetGenerator(llm=generator_llm, embedding_model=generator_embeddings)
+
+    # Low concurrency + generous retry/backoff — NVIDIA's free NIM tier rate-limits hard.
+    run_config = RunConfig(max_workers=1, max_retries=15, max_wait=90, timeout=300)
+
+    test_size = 6
+    print(f"Generating {test_size} synthetic Q&A pairs (throttled, this may take a while)...")
+
+    testset = generator.generate_with_langchain_docs(docs, testset_size=test_size, run_config=run_config)
+
     df = testset.to_pandas()
-    
+
     output_file = "testset.csv"
     df.to_csv(output_file, index=False)
-    
+
     print(f"\n✅ Successfully generated testset and saved to {output_file}!")
     print("Preview of generated questions:")
     for i, row in df.head(3).iterrows():
-        print(f"{i+1}. {row['question']}")
+        print(f"{i+1}. {row['user_input']}")
         
 if __name__ == "__main__":
     generate_testset()

@@ -72,6 +72,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from langgraph.graph import StateGraph, START, END
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from app.services.vectorstore import VectorStore
 from app.services.history import get_chat_history
@@ -95,6 +96,34 @@ def get_reranker():
         logger.info("[reranker] Loading BGE reranker...")
         cross_encoder = CrossEncoder('BAAI/bge-reranker-base')
     return cross_encoder
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Heuristic: retry on timeouts/connection/rate-limit errors, not on
+    genuine bad-request/auth failures — those will never succeed on retry."""
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "timeout", "timed out", "429", "rate limit", "too many requests",
+        "connection", "temporarily unavailable", "503", "502", "500",
+    ))
+
+
+def invoke_with_retry(chain, inputs: dict, max_attempts: int = 4):
+    """Invoke a LangChain runnable with exponential backoff.
+
+    Free-tier LLM APIs intermittently time out or rate-limit mid-graph —
+    a single transient failure on one node (e.g. a per-document relevance
+    grade) shouldn't kill an otherwise-successful multi-step run.
+    """
+    @retry(
+        stop=stop_after_attempt(max_attempts),
+        wait=wait_exponential(multiplier=1.5, min=2, max=30),
+        retry=retry_if_exception(_is_transient),
+        reraise=True,
+    )
+    def _call():
+        return chain.invoke(inputs)
+    return _call()
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -158,7 +187,7 @@ def input_guardrail(state: GraphState, llm) -> GraphState:
         ("human", "{question}"),
     ])
     grader = guard_prompt | llm | StrOutputParser()
-    result = grader.invoke({"question": state["question"][:500]}).strip().lower()
+    result = invoke_with_retry(grader, {"question": state["question"][:500]}).strip().lower()
     
     if result == "flagged":
         logger.warning("[guardrail] Input flagged: '%s'", state["question"][:60])
@@ -176,7 +205,7 @@ def hyde_generator(state: GraphState, llm) -> GraphState:
         ("human", "{question}"),
     ])
     generator = hyde_prompt | llm | StrOutputParser()
-    hypothetical = generator.invoke({"question": state["question"]})
+    hypothetical = invoke_with_retry(generator, {"question": state["question"]})
     logger.info("[hyde] Generated hypothetical answer (%d chars)", len(hypothetical))
     return {**state, "hypothetical_answer": hypothetical}
 
@@ -271,7 +300,7 @@ def grade_documents(state: GraphState, llm) -> GraphState:
 
     relevant_docs = []
     for doc in state["documents"]:
-        score = grader.invoke({
+        score = invoke_with_retry(grader, {
             "question": state["question"],
             "document": doc.page_content[:2000],  # truncate for grader
         }).strip().lower()
@@ -307,7 +336,7 @@ def rewrite_query(state: GraphState, llm) -> GraphState:
         ("human", "Original question: {question}"),
     ])
     rewriter = rewrite_prompt | llm | StrOutputParser()
-    new_q = rewriter.invoke({"question": state["question"]}).strip()
+    new_q = invoke_with_retry(rewriter, {"question": state["question"]}).strip()
     logger.info("[rewrite_query] '%s' → '%s'", state["question"][:60], new_q[:60])
     return {**state, "question": new_q, "iterations": state["iterations"] + 1}
 
@@ -368,7 +397,7 @@ def generate(state: GraphState, llm) -> GraphState:
          "{history}Question: {question}"),
     ])
     generator = generate_prompt | llm | StrOutputParser()
-    answer = generator.invoke({
+    answer = invoke_with_retry(generator, {
         "context": context,
         "history": history_text,
         "question": state["question"],
@@ -399,7 +428,7 @@ def grade_generation(state: GraphState, llm) -> GraphState:
     hallucination_grader = hallucination_prompt | llm | StrOutputParser()
 
     doc_text = "\n---\n".join(d.page_content[:500] for d in state["documents"][:3])
-    grounded = hallucination_grader.invoke({
+    grounded = invoke_with_retry(hallucination_grader, {
         "documents": doc_text or "No documents.",
         "generation": state["generation"][:1000],
     }).strip().lower()
@@ -416,7 +445,7 @@ def grade_generation(state: GraphState, llm) -> GraphState:
         ("human", "Question: {question}\n\nAnswer: {generation}"),
     ])
     usefulness_grader = usefulness_prompt | llm | StrOutputParser()
-    useful = usefulness_grader.invoke({
+    useful = invoke_with_retry(usefulness_grader, {
         "question": state["original_q"],
         "generation": state["generation"][:1000],
     }).strip().lower()
