@@ -61,6 +61,7 @@ State schema
 
 
 import os
+import time
 import logging
 from typing import Literal
 
@@ -72,7 +73,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from langgraph.graph import StateGraph, START, END
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, before_sleep_log
+from langsmith import traceable
 
 from app.services.vectorstore import VectorStore
 from app.services.history import get_chat_history
@@ -119,6 +121,7 @@ def invoke_with_retry(chain, inputs: dict, max_attempts: int = 4):
         stop=stop_after_attempt(max_attempts),
         wait=wait_exponential(multiplier=1.5, min=2, max=30),
         retry=retry_if_exception(_is_transient),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
     def _call():
@@ -177,6 +180,7 @@ def _get_web_search_tool():
 
 # ── Node implementations ────────────────────────────────────────────────────────
 
+@traceable(name="input_guardrail", run_type="chain")
 def input_guardrail(state: GraphState, llm) -> GraphState:
     """Check if the user prompt is safe."""
     guard_prompt = ChatPromptTemplate.from_messages([
@@ -196,6 +200,7 @@ def input_guardrail(state: GraphState, llm) -> GraphState:
     return {**state, "_input_flagged": False}
 
 
+@traceable(name="hyde_generator", run_type="chain")
 def hyde_generator(state: GraphState, llm) -> GraphState:
     """Generate a hypothetical answer to improve vector retrieval."""
     hyde_prompt = ChatPromptTemplate.from_messages([
@@ -209,6 +214,7 @@ def hyde_generator(state: GraphState, llm) -> GraphState:
     logger.info("[hyde] Generated hypothetical answer (%d chars)", len(hypothetical))
     return {**state, "hypothetical_answer": hypothetical}
 
+@traceable(name="retrieve_hybrid_search", run_type="retriever")
 def retrieve(state: GraphState) -> GraphState:
     """Retrieve top-k docs using Custom Hybrid Search (RRF) and HyDE."""
     logger.info("[retrieve] q='%s' user=%s iter=%d", state["question"][:80], state["user_id"], state["iterations"])
@@ -258,6 +264,7 @@ def retrieve(state: GraphState) -> GraphState:
     return {**state, "documents": docs}
 
 
+@traceable(name="rerank_bge_cross_encoder", run_type="retriever")
 def rerank_documents(state: GraphState) -> GraphState:
     """Rerank retrieved documents using a Cross-Encoder."""
     docs = state.get("documents", [])
@@ -278,6 +285,7 @@ def rerank_documents(state: GraphState) -> GraphState:
     return {**state, "documents": top_docs}
 
 
+@traceable(name="grade_documents_crag", run_type="chain")
 def grade_documents(state: GraphState, llm) -> GraphState:
     """
     Grade each retrieved document for relevance.
@@ -325,6 +333,7 @@ def grade_documents(state: GraphState, llm) -> GraphState:
     }
 
 
+@traceable(name="rewrite_query_selfrag", run_type="chain")
 def rewrite_query(state: GraphState, llm) -> GraphState:
     """Rewrite the question to improve vector retrieval."""
     rewrite_prompt = ChatPromptTemplate.from_messages([
@@ -341,6 +350,7 @@ def rewrite_query(state: GraphState, llm) -> GraphState:
     return {**state, "question": new_q, "iterations": state["iterations"] + 1}
 
 
+@traceable(name="web_search_crag_fallback", run_type="tool")
 def web_search(state: GraphState) -> GraphState:
     """CRAG: perform web search and prepend results as Document objects."""
     tool = _get_web_search_tool()
@@ -374,6 +384,7 @@ def web_search(state: GraphState) -> GraphState:
         return state
 
 
+@traceable(name="generate_answer", run_type="chain")
 def generate(state: GraphState, llm) -> GraphState:
     """Generate an answer using relevant docs + chat history."""
     context = "\n\n---\n\n".join(
@@ -406,6 +417,7 @@ def generate(state: GraphState, llm) -> GraphState:
     return {**state, "generation": answer}
 
 
+@traceable(name="grade_generation_selfrag", run_type="chain")
 def grade_generation(state: GraphState, llm) -> GraphState:
     """
     Grade the generation on two dimensions:
@@ -579,6 +591,7 @@ def get_rag_graph(llm):
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+@traceable(name="thotqen_rag_pipeline", run_type="chain")
 def run_rag_graph(
     question: str,
     session_id: str,
@@ -608,6 +621,26 @@ def run_rag_graph(
     }
 
     graph = get_rag_graph(llm)
-    final_state = graph.invoke(initial_state)
+    started = time.perf_counter()
+    try:
+        final_state = graph.invoke(initial_state)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        logger.warning(
+            "[RAG_SUMMARY] session=%s user=%s latency_ms=%d status=failed",
+            session_id, user_id, elapsed_ms,
+        )
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+
+    # Structured per-request summary — real numbers, independent of the
+    # LangSmith dashboard (visible directly in HF Space / terminal logs).
+    logger.info(
+        "[RAG_SUMMARY] session=%s user=%s latency_ms=%d status=ok iterations=%d "
+        "docs_used=%d web_search_used=%s answer_chars=%d",
+        session_id, user_id, elapsed_ms, final_state.get("iterations", 0),
+        len(final_state.get("documents", [])), final_state.get("web_searched", False),
+        len(final_state.get("generation", "")),
+    )
 
     return final_state.get("generation", "I was unable to generate an answer.")
