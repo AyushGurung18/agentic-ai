@@ -1,3 +1,4 @@
+import os
 import logging
 from fastapi import APIRouter, HTTPException
 from langsmith import Client
@@ -13,7 +14,19 @@ def get_langsmith_metrics():
     api_key = LANGCHAIN_API_KEY
 
     if not api_key or api_key == "your_langsmith_api_key_here":
-        raise HTTPException(status_code=503, detail="LangSmith API key not configured in .env")
+        # Report presence (not value) of each candidate env var so a
+        # misconfigured deployment is diagnosable from the error alone.
+        seen = {
+            "LANGSMITH_API_KEY": bool(os.getenv("LANGSMITH_API_KEY")),
+            "LANGCHAIN_API_KEY": bool(os.getenv("LANGCHAIN_API_KEY")),
+            "LANGSMITH_TRACING": os.getenv("LANGSMITH_TRACING"),
+            "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2"),
+        }
+        logger.warning("[LangSmith] API key not resolved. Env visibility: %s", seen)
+        raise HTTPException(
+            status_code=503,
+            detail=f"LangSmith API key not configured in this environment. Env var visibility: {seen}",
+        )
         
     try:
         client = Client(api_key=api_key)
