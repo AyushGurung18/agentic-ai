@@ -61,7 +61,47 @@ def get_langsmith_metrics():
                 })
                 
         avg_latency = (sum(latencies) / len(latencies)) if latencies else 0
-        
+
+        # Sparkline data — oldest to newest, capped at 20 points
+        latency_history = list(reversed(latencies[:20]))
+
+        # Node-by-node breakdown of the most recent full pipeline run, so the
+        # dashboard can show exactly which node cost how much time — not just
+        # one aggregate number for the whole request.
+        pipeline_breakdown = []
+        pipeline_root = next((r for r in runs if r.name == "thotqen_rag_pipeline"), None)
+        if pipeline_root is not None:
+            # thotqen_rag_pipeline -> LangGraph (single wrapper span) -> our
+            # named @traceable nodes. Walk down to the LangGraph span first,
+            # then pull its direct children — the actual node-level breakdown,
+            # not every nested LangChain sub-span (prompt/llm/parser).
+            direct_children = list(client.list_runs(
+                project_name=project_name,
+                parent_run_id=pipeline_root.id,
+                limit=50,
+            ))
+            graph_span = next((r for r in direct_children if r.name == "LangGraph"), None)
+            node_runs = []
+            if graph_span is not None:
+                node_runs = list(client.list_runs(
+                    project_name=project_name,
+                    parent_run_id=graph_span.id,
+                    limit=50,
+                ))
+            else:
+                node_runs = direct_children
+            node_runs.sort(key=lambda r: r.dotted_order or "")
+            for cr in node_runs:
+                cr_latency = 0
+                if cr.end_time and cr.start_time:
+                    cr_latency = round((cr.end_time - cr.start_time).total_seconds() * 1000)
+                pipeline_breakdown.append({
+                    "name": cr.name,
+                    "run_type": cr.run_type,
+                    "status": "error" if cr.error else "success",
+                    "latency_ms": cr_latency,
+                })
+
         return {
             "metrics": {
                 "total_runs": total_runs,
@@ -69,9 +109,11 @@ def get_langsmith_metrics():
                 "avg_latency_ms": round(avg_latency),
                 "total_tokens": total_tokens
             },
-            "recent_activity": recent_activity
+            "recent_activity": recent_activity,
+            "latency_history": [round(l) for l in latency_history],
+            "pipeline_breakdown": pipeline_breakdown,
         }
-        
+
     except Exception as e:
         logger.error(f"[LangSmith] Error fetching metrics: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch metrics from LangSmith: {str(e)}")
