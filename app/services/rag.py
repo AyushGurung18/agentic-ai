@@ -33,6 +33,7 @@ from app.services.chunking import hierarchical_chunk_text
 from app.services.vectorstore import VectorStore
 from app.services.document_service import ingest_document, ensure_session, ensure_user
 from app.services.hf_cache import append_messages_to_cache
+from app.services.history import save_message
 from app.services.langgraph_rag import run_rag_graph, invoke_with_retry
 from app.services.embeddings import embed_text
 from app.core.config import (
@@ -227,6 +228,16 @@ def ask_question(
     ensure_user(user_id, email=DEV_USER_EMAIL)
     ensure_session(session_id, user_id)
 
+    # Persist the user's question immediately — before running the graph —
+    # so it survives even if generation fails or times out. Without this,
+    # a session reload after any failure shows nothing at all, because
+    # nothing was ever saved: this pipeline previously never wrote to the
+    # messages table at all, only read from it for context.
+    try:
+        save_message(session_id, "user", question)
+    except Exception as exc:
+        logger.warning("[history] Failed to save user message: %s", exc)
+
     # Route intent to determine which model to use
     intent = route_intent(question)
     llm = get_llm_by_intent(intent)
@@ -242,11 +253,24 @@ def ask_question(
             llm=llm,
         )
     except Exception as e:
-        yield f"Error generating answer: {str(e)}"
+        error_answer = f"Error generating answer: {str(e)}"
+        try:
+            save_message(session_id, "assistant", error_answer)
+        except Exception as exc:
+            logger.warning("[history] Failed to save error message: %s", exc)
+        yield error_answer
         return
 
     if not full_answer.strip():
         full_answer = "I was unable to find relevant information to answer your question."
+
+    # Persist the assistant's answer as soon as it's ready — before the
+    # perceived-streaming yield loop below — so a reload reflects the real
+    # exchange even if the client disconnects mid-stream.
+    try:
+        save_message(session_id, "assistant", full_answer)
+    except Exception as exc:
+        logger.warning("[history] Failed to save assistant message: %s", exc)
 
     # ── Yield answer in chunks for perceived streaming ─────────────────────────
     # Chunk size of ~20 chars gives a natural typewriter feel
