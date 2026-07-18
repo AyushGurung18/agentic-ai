@@ -37,7 +37,7 @@ kombu>=5.3.0
 
 # CRAG web search tools
 duckduckgo-search>=6.0.0
-tavily-python                   # optional — set TAVILY_API_KEY to activate
+langchain-tavily                # optional — set TAVILY_API_KEY to activate
 
 # New RAG Features (Models, Evals, SSE, Reranking)
 langchain-google-genai
