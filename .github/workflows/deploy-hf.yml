@@ -1,0 +1,43 @@
+name: Deploy to Hugging Face Space
+
+# Keeps the aayos/thotqen HF Space in sync with GitHub main automatically.
+# HF Spaces don't pull from GitHub on their own — this pushes on every commit.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {} # allows a manual "Run workflow" trigger from the Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push clean snapshot to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # HF's pre-receive hook rejects large binaries without Git LFS/Xet.
+          # docs/*.png are documentation images with no runtime purpose in the
+          # Space, so they're excluded from this push only — they stay on
+          # GitHub, where README.md/ARCHITECTURE.md actually reference them.
+          rm -f docs/architecture_overview.png docs/pipeline_detail.png
+
+          # Push as a single orphan commit each run. The Space is a deploy
+          # target, not somewhere that needs GitHub's commit history — and
+          # reusing that history would drag every historical binary blob
+          # along even after the file is deleted at HEAD (this bit us the
+          # first time this was done manually).
+          git checkout --orphan hf-deploy
+          git add -A
+          git commit -m "Deploy: sync from GitHub ${GITHUB_SHA}"
+
+          git remote add hf-space "https://aayos:${HF_TOKEN}@huggingface.co/spaces/aayos/thotqen"
+          git push hf-space hf-deploy:main --force
