@@ -45,9 +45,11 @@ SUPABASE_URL        = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY   = os.environ.get("SUPABASE_ANON_KEY", "")
 
 # ── LangSmith (Observability) ────────────────────────────────────────────────
-LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2", "false").lower() == "true"
-LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
-LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "Thotqen-Prod-RAG")
+# LangSmith renamed its env vars from LANGCHAIN_* to LANGSMITH_* — check the
+# new names first, fall back to the legacy ones for compatibility.
+LANGCHAIN_TRACING_V2 = os.getenv("LANGSMITH_TRACING", os.getenv("LANGCHAIN_TRACING_V2", "false")).lower() == "true"
+LANGCHAIN_API_KEY = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
+LANGCHAIN_PROJECT = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT", "Thotqen-Prod-RAG")
 
 # ── Celery / RabbitMQ (CloudAMQP) ─────────────────────────────────────────────
 # CloudAMQP provides this URL from the dashboard.
