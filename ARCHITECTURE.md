@@ -6,30 +6,73 @@ This document provides a comprehensive breakdown of the **AI Knowledge Copilot**
 
 ## 🏗️ High-Level Architecture
 
+![System architecture](docs/architecture_overview.png)
+
+Client → Cloudflare Worker edge gateway (CORS, semantic cache, R2 doc serving, reverse proxy with timeout/retry) → FastAPI backend → intent-routed multi-provider LLMs → LangGraph CRAG/Self-RAG pipeline → Postgres/pgvector + R2 storage, with every request fully traced through LangSmith and scored offline via a RAGAS eval harness.
+
+<details>
+<summary>Mermaid source (editable)</summary>
+
 ```mermaid
-graph TD
-    User([User]) <--> Frontend[Next.js Frontend]
-    Frontend -- "REST API (Upload/Ask/SSE)" --> Backend[FastAPI Backend]
-    subgraph "Document Ingestion (Async)"
-        Backend -- "POST /upload" --> Worker[Celery Worker]
-        Worker -- "AMQP" --> RabbitMQ[(CloudAMQP / RabbitMQ)]
-        Worker --> Chunker[Hierarchical Chunker]
-        Chunker --> Embedder[Embedding Engine]
-        Embedder --> DB[(Supabase PostgreSQL + pgvector)]
-        Worker -- "progress_percent" --> DB
+flowchart LR
+    UI["Next.js Client\n(bbygrl)\nSupabase Auth"]
+
+    subgraph Edge["Cloudflare Worker · edge-gateway"]
+        direction TB
+        Proxy["Reverse proxy\ntimeout + retry"]
+        CacheCheck{"Semantic cache\nKV lookup"}
+        DocServe["R2 doc serve\n/edge/docs/*"]
     end
-    subgraph "Query Pipeline (LangGraph)"
-        Backend -- "GET /ask" --> Router[Intent Router]
-        Router -- "cheap" --> LLM_Cheap[Gemini Flash / Llama 8B]
-        Router -- "complex" --> LLM_Complex[Nvidia 70B / Gemini Pro]
-        LLM_Complex --> Graph[LangGraph Pipeline]
-        LLM_Cheap --> Graph
-        Graph --> DB
-        Graph -- "Traces" --> LangSmith[(LangSmith Dashboard)]
+
+    subgraph API["FastAPI · thotqen (HF Spaces)"]
+        direction TB
+        Endpoints["/upload · /chat\n/api/admin/metrics"]
+        Intent{"route_intent\ncheap / complex"}
     end
-    Frontend -- "GET /upload/stream/{job_id}" --> SSE[SSE Endpoint]
-    SSE --> DB
+
+    subgraph Async["Async Ingestion"]
+        direction TB
+        Celery["Celery + CloudAMQP"]
+        Chunk["Hierarchical chunk\n→ local MiniLM embed"]
+    end
+
+    LLMs["Multi-Provider LLMs\ncheap: Gemini → Groq → vLLM\ncomplex: NVIDIA → Gemini → Groq → vLLM"]
+
+    RAG["LangGraph Pipeline\nCRAG + Self-RAG\n(guardrail → HyDE → hybrid retrieve\n→ rerank → grade → generate → grade)"]
+
+    subgraph Store["Storage"]
+        direction TB
+        PG[("Postgres\npgvector + HNSW + BM25")]
+        R2[("Cloudflare R2")]
+        KV[("Cloudflare KV")]
+    end
+
+    subgraph Obs["Observability"]
+        direction TB
+        LS["LangSmith\ntrace tree per request"]
+        RAGAS["RAGAS eval\nfaithfulness/relevancy/precision/recall"]
+        Dash["Live admin dashboard"]
+    end
+
+    UI -- "REST + SSE" --> Proxy
+    Proxy --> CacheCheck
+    Proxy --> DocServe
+    CacheCheck -- miss --> Endpoints
+    Endpoints --> Intent
+    Endpoints --> Celery
+    Intent --> LLMs
+    LLMs --> RAG
+    Celery --> Chunk
+    Chunk --> PG
+    RAG --> PG
+    RAG -- traces --> LS
+    DocServe --> R2
+    CacheCheck -- hit --> KV
+    LS --> RAGAS
+    LS --> Dash
 ```
+
+</details>
 
 ---
 
@@ -37,75 +80,80 @@ graph TD
 
 ### 1. Frontend (`bbygrl`)
 - **Next.js (React 19)**: Core framework for UI and routing.
-- **GSAP**: High-end micro-animations and scroll effects.
-- **HTML5 Canvas**: Interactive animal animations reflecting AI state.
-- **Tailwind CSS**: Utility-first styling.
+- **Supabase Auth**: Anonymous + email sign-in.
+- **Tailwind / inline styles**: UI styling.
 
-### 2. Backend (`thotqen`)
+### 2. Edge (`edge-gateway`, Cloudflare Worker)
+- Reverse proxy to the FastAPI origin with explicit timeout + retry handling (502/504 on origin failure instead of an opaque CORS error).
+- CORS enforced via an explicit origin allowlist.
+- Direct R2 document serving at `/edge/docs/*`, bypassing the origin entirely.
+- Semantic cache check/write against Cloudflare KV before hitting the LLM pipeline on `/chat`.
+
+### 3. Backend (`thotqen`)
 - **FastAPI**: Async Python web framework with SSE support (`sse_starlette`).
 - **LangGraph**: Stateful agentic RAG pipeline (see pipeline section below).
 - **Celery + RabbitMQ (CloudAMQP)**: Background workers for async PDF ingestion.
 - **PyMuPDF (`pymupdf4llm`)**: PDF text and structure extraction.
 - **Supabase (PostgreSQL + pgvector + HNSW)**: Stores documents, embeddings, jobs, and chat history.
 
-### 3. AI / ML / Observability
-- **Intent Router**: Groq Llama 3.1 8B classifies queries as `cheap` or `complex`.
-- **Cheap LLMs**: Gemini 1.5 Flash (`langchain-google-genai`), Llama 3.1 8B (Groq).
-- **Complex LLMs**: Nvidia Llama 3.1 70B (`langchain-nvidia-ai-endpoints`), Gemini 1.5 Pro.
+### 4. AI / ML / Observability
+- **Intent Router**: A fast/cheap model classifies each query as `cheap` or `complex` before routing.
+- **Cheap tier**: Gemini 2.5 Flash → Groq Llama 3.1 8B → self-hosted vLLM (PagedAttention) fallback.
+- **Complex tier**: NVIDIA-hosted Llama 3.1 70B → Gemini 2.5 Pro → Groq Llama 3.3 70B → self-hosted vLLM fallback.
 - **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim).
-- **Reranker**: `cross-encoder/ms-marco-MiniLM-L-6-v2` (local Cross-Encoder).
-- **LangSmith**: Production grade LLM observability (traces every step, token usage, and latency).
-- **Ragas**: Pro-grade evaluation framework (`scripts/generate_testset.py` & `scripts/run_evals.py`) scoring Context Precision, Context Recall, Answer Relevance, and Faithfulness.
+- **Reranker**: `BAAI/bge-reranker-base` (local BGE cross-encoder).
+- **CRAG web fallback**: Tavily (DuckDuckGo fallback if no `TAVILY_API_KEY`).
+- **Resilience**: every LLM call in the graph is wrapped in exponential-backoff retry (tenacity) — a transient timeout/rate-limit on one node doesn't kill the whole run.
+- **LangSmith**: Every node in the graph carries a named `@traceable` span — a full request renders as one readable trace tree (guardrail → HyDE → retrieve → rerank → grade → generate → grade), not scattered LLM calls.
+- **RAGAS**: Offline eval harness (`scripts/generate_testset.py` + `scripts/run_evals.py`) scoring Context Precision, Context Recall, Answer Relevancy, and Faithfulness against a synthetic testset generated from real ingested documents.
+- **Live admin dashboard**: `GET /api/admin/metrics` pulls real run counts, success rate, latency, and token usage straight from the LangSmith API.
 
 ---
 
 ## 🔄 Document Ingestion Workflow
 
-1. **Upload**: User sends `POST /upload` with a PDF.
-2. **Job Created**: API creates a `document_jobs` row and returns `job_id` instantly.
+1. **Upload**: User sends `POST /upload` with a PDF (size-capped, rejected before fully buffering if oversized).
+2. **Job Created**: API creates a `document_jobs` row and returns `job_id` instantly; the raw PDF is stored in R2.
 3. **Queue**: A Celery task is dispatched to CloudAMQP.
 4. **SSE Stream**: Client connects to `GET /upload/stream/{job_id}` to receive real-time progress events (0% → 100%).
 5. **Hierarchical Chunking**:
    - Large **Parent** chunks (~1500 tokens) — stored for context retrieval.
    - Small **Child** chunks (~300 tokens) — embedded and indexed for precision search.
-6. **Embedding**: Child chunks are batch-embedded (32 at a time) and stored in `embeddings` table.
+6. **Embedding**: Child chunks are batch-embedded locally and stored in the `embeddings` table (384-dim, matching the vector column).
 7. **FTS Index**: A PostgreSQL trigger auto-populates a `tsvector` column for BM25 keyword search.
 8. **Job Done**: `document_jobs.status` → `done`, `progress_percent` → `100`.
 
 ---
 
-## 🤖 Query Pipeline (LangGraph)
+## 🤖 Query Pipeline (LangGraph — CRAG + Self-RAG)
 
-Every user question flows through a stateful graph:
+Every user question flows through a stateful graph, fully traced in LangSmith node-by-node:
 
+![LangGraph pipeline detail](docs/pipeline_detail.png)
+
+<details>
+<summary>Mermaid source (editable)</summary>
+
+```mermaid
+flowchart TD
+    START(["User question"]) --> IG["input_guardrail\nLLM safety check"]
+    IG -- flagged --> BLOCKED(["Request blocked"])
+    IG -- safe --> HYDE["hyde_generator\nhypothetical answer for recall"]
+    HYDE --> RET["retrieve\nhybrid search: BM25 + HNSW vector → RRF"]
+    RET --> RERANK["rerank_documents\nBGE cross-encoder, keep top-5"]
+    RERANK --> GRADE{"grade_documents\nCRAG relevance check"}
+    GRADE -- "all irrelevant\nno web search yet" --> WEB["web_search\nTavily (DuckDuckGo fallback)"]
+    GRADE -- "all irrelevant\nweb already tried" --> RW1["rewrite_query"]
+    GRADE -- "some relevant" --> GEN["generate\nanswer from filtered context"]
+    WEB --> GEN
+    RW1 --> RET
+    GEN --> GG{"grade_generation\nSelf-RAG: grounded? useful?"}
+    GG -- "hallucinated or\nunhelpful, under 3 loops" --> RW2["rewrite_query"]
+    GG -- "grounded + useful" --> DONE(["Final answer"])
+    RW2 --> RET
 ```
-START
-  │
-  ▼
-[input_guardrail]     ← LLM safety check (prompt injection / toxic)
-  │ safe
-  ▼
-[hyde_generator]      ← Generates hypothetical answer to enrich query embedding
-  │
-  ▼
-[retrieve]            ← Hybrid Search: BM25 + Vector → RRF merge → Parent expansion
-  │
-  ▼
-[rerank_documents]    ← Cross-Encoder reranker, keeps top-5
-  │
-  ▼
-[grade_documents]     ← LLM grades each doc: relevant ("yes") or not ("no")
-  │
-  ├─ all irrelevant + no web yet → [web_search] → [generate]
-  ├─ all irrelevant + web done  → [rewrite_query] → [retrieve]
-  └─ some relevant              → [generate]
-                                      │
-                                      ▼
-                               [grade_generation]  ← hallucination + usefulness check
-                                      │
-                                  ├─ bad  → [rewrite_query]  (max 3 loops)
-                                  └─ good → END
-```
+
+</details>
 
 ### Hybrid Search (RRF)
 The `hybrid_search` PostgreSQL function combines:
@@ -124,13 +172,14 @@ When a child chunk is retrieved, its **parent chunk** content is returned to the
 |---|---|
 | `main.py` | FastAPI app factory, CORS, lifespan hooks |
 | `routes.py` | Public endpoints: `/upload`, `/upload/status/{id}`, `/upload/stream/{id}`, `/ask`, `/chat` |
+| `admin_routes.py` | `GET /api/admin/metrics` — live LangSmith run stats for the admin dashboard |
 | `cache_routes.py` | Internal endpoints: semantic cache check/write, Cloudflare KV invalidation |
-| `core/config.py` | All env vars (Groq, Gemini, Nvidia, DB, Celery, Supabase) |
+| `core/config.py` | All env vars (Groq, Gemini, NVIDIA, vLLM, DB, Celery, Supabase, LangSmith) |
 | `core/auth.py` | JWT auth via `python-jose` |
 | `worker/celery_app.py` | Celery factory wired to CloudAMQP |
 | `worker/tasks.py` | `ingest_document_task` — runs chunking, embedding, DB writes with progress |
 | `services/rag.py` | `ask_question` entry point; Intent Router → `run_rag_graph` |
-| `services/langgraph_rag.py` | Full LangGraph pipeline (see above) |
+| `services/langgraph_rag.py` | Full LangGraph pipeline (see above), retry/backoff, LangSmith tracing |
 | `services/chunking.py` | `hierarchical_chunk_text` — Parent→Child splitting |
 | `services/document_service.py` | `ingest_document` — DB writes for parent/child chunks |
 | `services/embeddings.py` | `embed_text` — local sentence-transformers |
@@ -138,7 +187,8 @@ When a child chunk is retrieved, its **parent chunk** content is returned to the
 | `services/history.py` | `PostgresChatMessageHistory` per session |
 | `db/database.py` | psycopg3 connection pool |
 | `db/init.sql` | Full schema: documents, chunks (parent/child), embeddings, jobs, cache, hybrid_search() |
-| `scripts/evaluate_sessions.py` | Offline Ragas eval (answer_relevance, faithfulness) |
+| `scripts/generate_testset.py` | Synthetic RAGAS testset generation from ingested documents |
+| `scripts/run_evals.py` | Offline RAGAS eval run (faithfulness, answer relevancy, context precision/recall) |
 
 ---
 
@@ -149,6 +199,7 @@ When a child chunk is retrieved, its **parent chunk** content is returned to the
 3. **Hybrid Search (RRF)**: BM25 catches exact-match keywords (names, codes); vector search catches semantic similarity. RRF fuses both without needing score normalization.
 4. **HyDE**: Generating a hypothetical answer before retrieval drastically improves semantic recall for complex or abstract queries.
 5. **Async Ingestion with SSE**: Large PDFs are processed in the background; the frontend receives real-time progress via Server-Sent Events instead of polling.
-6. **Offline Evals**: Ragas metrics are run on demand via a script, not inline, to keep request latency minimal.
-7. **Pro-Grade Observability**: Using LangSmith, the LangGraph execution is fully traced. Every LLM call, API request, token count, and latency metric is logged to a central dashboard.
-8. **Live Admin Telemetry**: A custom Next.js frontend page at `/admin` polls `GET /api/admin/metrics` to render live glassmorphism charts of LLM performance.
+6. **Offline Evals as a Regression Gate**: RAGAS metrics are run on demand via a script, not inline, to keep request latency minimal — the goal is catching quality regressions before merge, not proving a fabricated improvement delta on every change.
+7. **Pro-Grade Observability**: Using LangSmith, the LangGraph execution is fully traced — every node, LLM call, token count, and latency metric is logged to a central dashboard.
+8. **Live Admin Telemetry**: `GET /api/admin/metrics` queries the LangSmith API directly and feeds a live dashboard — real numbers, not static claims.
+9. **Resilience by Design**: every LLM call in the graph retries with exponential backoff on transient failures (timeouts, 429s, 5xxs), and the pipeline degrades gracefully — an honest "I don't know" instead of a hallucination when retrieval or grading can't complete.
