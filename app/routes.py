@@ -118,18 +118,19 @@ async def upload(
                 status_code=413,
                 detail=f"File exceeds the {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB upload limit.",
             )
-        pdf_buffer = _io.BytesIO(raw_bytes)
 
         # 1. Upload the raw PDF to R2 for storage
+        # boto3's upload_fileobj() closes the buffer it's given once the
+        # transfer completes — give it its own BytesIO instead of sharing
+        # one with text extraction, or the second read fails with
+        # "I/O operation on closed file."
         try:
-            pdf_buffer.seek(0)
-            r2_url = upload_file_stream_to_r2(pdf_buffer, file.filename)
+            r2_url = upload_file_stream_to_r2(_io.BytesIO(raw_bytes), file.filename)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to upload to R2: {str(e)}")
 
         # 2. Extract text in-process (fast; just PDF parsing, not embedding)
-        pdf_buffer.seek(0)
-        text = extract_text(pdf_buffer)
+        text = extract_text(_io.BytesIO(raw_bytes))
         if not text.strip():
             raise HTTPException(status_code=422, detail="PDF appears to be empty or unreadable.")
 
