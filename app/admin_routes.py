@@ -1,7 +1,7 @@
-import os
 import logging
 from fastapi import APIRouter, HTTPException
 from langsmith import Client
+from app.core.config import LANGCHAIN_API_KEY, LANGCHAIN_PROJECT
 
 logger = logging.getLogger("admin")
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -9,9 +9,9 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 @router.get("/metrics")
 def get_langsmith_metrics():
     """Fetch live observability metrics and recent traces from LangSmith."""
-    project_name = os.getenv("LANGCHAIN_PROJECT", "Thotqen-Prod-RAG")
-    api_key = os.getenv("LANGCHAIN_API_KEY")
-    
+    project_name = LANGCHAIN_PROJECT
+    api_key = LANGCHAIN_API_KEY
+
     if not api_key or api_key == "your_langsmith_api_key_here":
         raise HTTPException(status_code=503, detail="LangSmith API key not configured in .env")
         
