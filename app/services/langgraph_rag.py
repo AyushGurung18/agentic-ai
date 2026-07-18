@@ -147,17 +147,17 @@ class GraphState(TypedDict, total=False):
     _input_flagged:      bool                      # set by input guardrail
 
 
-# ── Web search setup (DuckDuckGo default, Tavily if key present) ───────────────
+# ── Web search setup (Tavily preferred, DuckDuckGo fallback) ───────────────────
 
 def _build_web_search_tool():
     tavily_key = os.getenv("TAVILY_API_KEY", "")
     if tavily_key:
         try:
-            from langchain_community.tools.tavily_search import TavilySearchResults
+            from langchain_tavily import TavilySearch
             logger.info("[CRAG] Using Tavily for web search")
-            return TavilySearchResults(max_results=3, tavily_api_key=tavily_key)
+            return TavilySearch(max_results=3, tavily_api_key=tavily_key)
         except ImportError:
-            logger.warning("[CRAG] tavily-python not installed, falling back to DuckDuckGo")
+            logger.warning("[CRAG] langchain-tavily not installed, falling back to DuckDuckGo")
 
     try:
         from langchain_community.tools import DuckDuckGoSearchRun
@@ -361,9 +361,19 @@ def web_search(state: GraphState) -> GraphState:
     logger.info("[web_search] Searching web for: '%s'", state["question"][:80])
     try:
         results = tool.invoke(state["question"])
-        # Normalize — DuckDuckGo returns str, Tavily returns list[dict]
+        # Normalize — DuckDuckGo returns str, Tavily (langchain_tavily.TavilySearch)
+        # returns {"results": [...]}, older tools returned a bare list[dict].
         if isinstance(results, str):
             web_docs = [Document(page_content=results, metadata={"source": "web"})]
+        elif isinstance(results, dict) and "results" in results:
+            web_docs = [
+                Document(
+                    page_content=r.get("content", ""),
+                    metadata={"source": r.get("url", "web")},
+                )
+                for r in results["results"]
+                if r.get("content")
+            ]
         elif isinstance(results, list):
             web_docs = [
                 Document(
