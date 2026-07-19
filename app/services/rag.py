@@ -61,7 +61,7 @@ from app.services.embeddings import embed_text
 from app.core.config import (
     CHUNK_SIZE, CHUNK_OVERLAP,
     VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY,
-    GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY,
+    GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY,
     DEV_USER_ID, DEV_USER_EMAIL,
 )
 
@@ -151,6 +151,22 @@ def _get_vllm_llm(temperature: float) -> ChatOpenAI:
     )
 
 
+def _get_openrouter_llm(temperature: float) -> ChatOpenAI:
+    """OpenRouter's free auto-router — OpenAI-compatible, so this reuses
+    ChatOpenAI exactly like the vLLM fallback, just pointed at OpenRouter's
+    endpoint. "openrouter/free" picks whichever free model is actually
+    available behind the scenes (the free lineup rotates over time), so
+    there's no specific free model name to hardcode and keep up to date.
+    """
+    return ChatOpenAI(
+        model="openrouter/free",
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        temperature=temperature,
+        request_timeout=12,
+    )
+
+
 def get_llm_by_intent(intent: str):
     """Returns an LLM with automatic cross-provider fallback baked in.
 
@@ -181,6 +197,8 @@ def get_llm_by_intent(intent: str):
             candidates.append(("Gemini 1.5 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if GROQ_API_KEY:
             candidates.append(("Groq Llama 3.1 8B", ChatGroq(model_name="llama-3.1-8b-instant", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+        if OPENROUTER_API_KEY:
+            candidates.append(("OpenRouter (free)", _get_openrouter_llm(temperature=temperature)))
     else:
         temperature = 0.2
         candidates = []
@@ -190,6 +208,8 @@ def get_llm_by_intent(intent: str):
             candidates.append(("Gemini 1.5 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if GROQ_API_KEY:
             candidates.append(("Groq Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+        if OPENROUTER_API_KEY:
+            candidates.append(("OpenRouter (free)", _get_openrouter_llm(temperature=temperature)))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
     candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
