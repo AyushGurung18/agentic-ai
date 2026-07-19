@@ -6,24 +6,66 @@ user UUID.
 
 How it works
 ────────────
-  • Supabase signs every session JWT (HS256) with the project JWT Secret.
+  • Supabase's newer projects sign session JWTs asymmetrically (ES256, via
+    rotating "JWT Signing Keys") rather than with a single shared HS256
+    secret. We verify against Supabase's public JWKS endpoint, matching
+    the token's `kid` header to the right key — this also means key
+    rotation on Supabase's side is handled automatically, nothing to
+    keep in sync manually.
+  • Falls back to the legacy shared-secret HS256 path if a token's header
+    says `alg: HS256` (older Supabase projects still on that system).
   • Both real users AND anonymous users get a valid JWT whose `sub` claim
     is a stable UUID — so they're treated identically in the DB.
   • If no Bearer token is supplied (local dev), we fall back to DEV_USER_ID.
 
 Required .env keys
 ──────────────────
-  SUPABASE_JWT_SECRET   → Dashboard ▶ Settings ▶ API ▶ JWT Settings ▶ JWT Secret
+  SUPABASE_URL          → used to derive the JWKS endpoint
+  SUPABASE_JWT_SECRET   → only needed for legacy HS256 projects
 """
 
+import time
 from typing import Optional
+
+import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError, ExpiredSignatureError
 
-from app.core.config import SUPABASE_JWT_SECRET, DEV_USER_ID
+from app.core.config import SUPABASE_JWT_SECRET, SUPABASE_URL, DEV_USER_ID
 
 _bearer = HTTPBearer(auto_error=False)
+
+_JWKS_TTL_SECONDS = 3600
+_jwks_cache: dict = {"keys": [], "fetched_at": 0.0}
+
+
+def _fetch_jwks(force: bool = False) -> list:
+    now = time.time()
+    if force or not _jwks_cache["keys"] or (now - _jwks_cache["fetched_at"]) > _JWKS_TTL_SECONDS:
+        resp = httpx.get(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json", timeout=10)
+        resp.raise_for_status()
+        _jwks_cache["keys"] = resp.json().get("keys", [])
+        _jwks_cache["fetched_at"] = now
+    return _jwks_cache["keys"]
+
+
+def _verify_with_jwks(token: str, kid: Optional[str], alg: str) -> dict:
+    keys = _fetch_jwks()
+    matching = next((k for k in keys if k.get("kid") == kid), None)
+    if matching is None:
+        # Key may have rotated since our cache was populated — refresh once.
+        keys = _fetch_jwks(force=True)
+        matching = next((k for k in keys if k.get("kid") == kid), None)
+    if matching is None:
+        raise JWTError(f"No JWKS key found for kid={kid!r}")
+
+    return jwt.decode(
+        token,
+        matching,
+        algorithms=[alg],
+        audience="authenticated",
+    )
 
 
 def get_current_user_id(
@@ -37,22 +79,27 @@ def get_current_user_id(
     ─ Token invalid → HTTP 401
     """
     if credentials is None:
-        # No token — allow in dev; in production set SUPABASE_JWT_SECRET
-        # and the frontend will always send one.
-        return DEV_USER_ID
-
-    if not SUPABASE_JWT_SECRET:
-        # Secret not configured — skip verification (dev mode)
+        # No token — allow in dev; in production the frontend always sends one.
         return DEV_USER_ID
 
     token = credentials.credentials
+
     try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg", "")
+
+        if alg == "HS256":
+            if not SUPABASE_JWT_SECRET:
+                return DEV_USER_ID
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+        else:
+            payload = _verify_with_jwks(token, header.get("kid"), alg or "ES256")
+
         return str(payload["sub"])
     except ExpiredSignatureError:
         raise HTTPException(
