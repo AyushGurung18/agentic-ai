@@ -61,8 +61,12 @@ def _get_local_embedding(text: str) -> list[float] | None:
         return None
 
 
-def _write_to_semantic_cache(question: str, answer: str) -> None:
-    """Persist a Q&A pair to the semantic cache via the internal endpoint."""
+def _write_to_semantic_cache(question: str, answer: str, session_id: str) -> None:
+    """Persist a Q&A pair to the semantic cache via the internal endpoint.
+
+    Scoped by session_id — see cache_routes.py / the 2026-07-19 migration
+    for why an unscoped cache incorrectly leaked answers across documents.
+    """
     embedding = _get_local_embedding(question)
     if embedding is None:
         return
@@ -72,7 +76,7 @@ def _write_to_semantic_cache(question: str, answer: str) -> None:
         resp = httpx.post(
             f"{base_url}/api/internal/cache-write",
             headers={"X-Internal-Secret": internal_secret, "Content-Type": "application/json"},
-            json={"raw_question": question, "cached_answer": answer, "embedding": embedding},
+            json={"raw_question": question, "cached_answer": answer, "embedding": embedding, "session_id": session_id},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -283,7 +287,7 @@ def ask_question(
         logger.info("[SemanticCache] 📝 Queuing cache write (len=%d chars)", len(full_answer))
         t = threading.Thread(
             target=_write_to_semantic_cache,
-            args=(question, full_answer),
+            args=(question, full_answer, session_id),
             daemon=True,
         )
         t.start()

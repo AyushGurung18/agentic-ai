@@ -53,6 +53,9 @@ class VectorCacheCheckRequest(BaseModel):
     # (legacy — kept for backward compat but ignored when question is provided)
     question: str | None = None
     vector: conlist(float, min_length=384, max_length=384) | None = None
+    # Required — a cache hit must never cross session/document boundaries.
+    # See supabase/migrations/20260719_scope_semantic_cache_by_session.sql
+    session_id: str
 
     def model_post_init(self, __context):
         if self.question is None and self.vector is None:
@@ -67,9 +70,13 @@ class CacheWriteRequest(BaseModel):
     raw_question: str
     cached_answer: str
     embedding: conlist(float, min_length=384, max_length=384)
+    session_id: str
 
 # ---------------------------------------------------------------------------
-# 1️⃣ Vector cache check – calls the PL/pgSQL ``match_semantic_cache`` function.
+# 1️⃣ Vector cache check — scoped to session_id so a hit can only ever replay
+#    an answer generated within the same conversation/document context.
+#    (Previously matched on question-text similarity alone, globally, across
+#    every user and every document — see the 2026-07-19 migration.)
 # ---------------------------------------------------------------------------
 @router.post("/vector-cache-check", response_model=VectorCacheCheckResponse, dependencies=[Depends(validate_internal_secret)])
 def vector_cache_check(payload: VectorCacheCheckRequest):
@@ -94,18 +101,19 @@ def vector_cache_check(payload: VectorCacheCheckRequest):
                 SELECT cached_answer,
                        1 - ( %s::vector <=> embedding ) AS similarity
                 FROM public.semantic_responses_cache
-                WHERE ( %s::vector <=> embedding ) <= (1 - %s)
+                WHERE session_id = %s::uuid
+                  AND ( %s::vector <=> embedding ) <= (1 - %s)
                 ORDER BY similarity DESC
                 LIMIT 1;
             """
-            cur.execute(sql, (query_vec, query_vec, threshold))
+            cur.execute(sql, (query_vec, payload.session_id, query_vec, threshold))
             row = cur.fetchone()
 
             if row:
-                logger.info("[Cache Hit] similarity=%.4f", row["similarity"])
+                logger.info("[Cache Hit] session=%s similarity=%.4f", payload.session_id, row["similarity"])
                 return VectorCacheCheckResponse(hit=True, cached_answer=row["cached_answer"], similarity=row["similarity"])
             else:
-                logger.info("[Cache Miss] No semantic match (threshold=%.2f)", threshold)
+                logger.info("[Cache Miss] session=%s No semantic match (threshold=%.2f)", payload.session_id, threshold)
                 return VectorCacheCheckResponse(hit=False)
 
 # ---------------------------------------------------------------------------
@@ -116,10 +124,10 @@ def cache_write(request: CacheWriteRequest):
     with get_conn() as conn:
         with conn.cursor() as cur:
             sql = """
-                INSERT INTO public.semantic_responses_cache (raw_question, cached_answer, embedding)
-                VALUES (%s, %s, %s::vector);
+                INSERT INTO public.semantic_responses_cache (raw_question, cached_answer, embedding, session_id)
+                VALUES (%s, %s, %s::vector, %s::uuid);
             """
-            cur.execute(sql, (request.raw_question, request.cached_answer, str(request.embedding)))
+            cur.execute(sql, (request.raw_question, request.cached_answer, str(request.embedding), request.session_id))
         conn.commit()
     logger.info("[Cache Write] New semantic cache entry stored for question: %s", request.raw_question[:50])
     return {"status": "written"}
