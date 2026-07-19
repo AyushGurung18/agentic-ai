@@ -3,25 +3,35 @@ app/worker/tasks.py
 ────────────────────
 Celery tasks for background document processing.
 
-The only task here is `ingest_document_task`, which:
-  1. Marks the job as "processing" in document_jobs
-  2. Calls process_document() (chunk → embed → PGVector insert)
-  3. Marks the job as "done" (or "failed" on exception)
+`ingest_document_task` is a lightweight bridge, not the actual worker: it
+relays the job to the Cloud Run ingestion service (cloud_run_ingest/) over
+HTTP instead of doing the chunk/embed/store work itself. This is
+deliberate — this process no longer imports anything that touches
+torch/sentence-transformers, so it stays small and never OOMs the HF
+Space, and the heavy compute only runs (and only costs anything) while
+Cloud Run is actually processing a job, not sitting idle 24/7.
 
-Status transitions:
+Status transitions (now mostly owned by cloud_run_ingest, which has the
+fullest picture of actual progress):
     pending → processing → done
-                        ↘ failed (on any exception)
+                        ↘ failed (on any exception, including this
+                          bridge failing to reach Cloud Run at all)
 """
 
 import logging
+import os
+
+import httpx
 from celery import Task
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.worker.celery_app import celery_app
 from app.db.database import get_conn
-from app.services.rag import process_document
 
 logger = logging.getLogger("worker.tasks")
+
+INGEST_SERVICE_URL = os.environ.get("INGEST_SERVICE_URL", "")
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET", "")
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -67,7 +77,11 @@ def ingest_document_task(
     metadata_tags: dict | None = None,
 ) -> dict:
     """
-    Background task: chunk + embed a document and store in PGVector.
+    Relay a document to the Cloud Run ingestion service and wait for it to
+    finish. Cloud Run does the actual chunk/embed/store work and owns the
+    "processing"/progress/"done" updates on document_jobs from there —
+    this task's own status writes just cover the window before Cloud Run
+    picks it up, and failures if it can't be reached at all.
 
     Parameters
     ----------
@@ -82,28 +96,40 @@ def ingest_document_task(
     -------
     dict with document_id on success
     """
-    logger.info("[ingest_document_task] job_id=%s filename=%s user=%s", job_id, filename, user_id)
+    logger.info(
+        "[ingest_document_task] job_id=%s filename=%s user=%s -> forwarding to Cloud Run",
+        job_id, filename, user_id,
+    )
 
-    # ── Mark as processing ─────────────────────────────────────────────────────
+    if not INGEST_SERVICE_URL:
+        _update_job(job_id, status="failed", error="INGEST_SERVICE_URL is not configured.")
+        raise RuntimeError("INGEST_SERVICE_URL is not configured.")
+
     _update_job(job_id, status="processing", progress_percent=0)
-    
-    def on_progress(percent: int):
-        _update_job(job_id, progress_percent=percent)
 
     try:
-        document_id = process_document(
-            text=text,
-            filename=filename,
-            user_id=user_id,
-            session_id=session_id,
-            metadata_tags=metadata_tags or {},
-            progress_callback=on_progress,
+        resp = httpx.post(
+            f"{INGEST_SERVICE_URL}/ingest",
+            json={
+                "job_id": job_id,
+                "text": text,
+                "filename": filename,
+                "user_id": user_id,
+                "session_id": session_id,
+                "metadata_tags": metadata_tags or {},
+            },
+            headers={"X-Internal-Secret": INTERNAL_API_SECRET},
+            # Generous — matches Cloud Run cold start (torch + model load)
+            # plus the same ~10min ceiling the old in-process task used.
+            timeout=600,
         )
-
-        # ── Mark as done ───────────────────────────────────────────────────────
-        _update_job(job_id, status="done", progress_percent=100, document_id=document_id)
-        logger.info("[ingest_document_task] ✅ Done job_id=%s document_id=%s", job_id, document_id)
-        return {"job_id": job_id, "document_id": document_id}
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info(
+            "[ingest_document_task] ✅ Done job_id=%s document_id=%s",
+            job_id, data.get("document_id"),
+        )
+        return data
 
     except SoftTimeLimitExceeded:
         # Graceful timeout — mark failed so the client knows
@@ -111,13 +137,17 @@ def ingest_document_task(
         logger.error("[ingest_document_task] ⏱ Soft time limit exceeded for job_id=%s", job_id)
         raise  # Let Celery handle it
 
+    except httpx.HTTPStatusError as exc:
+        # Cloud Run already updated document_jobs itself for errors that
+        # happen mid-ingestion — this covers the ones it couldn't (e.g. the
+        # auth check rejecting the request before any work started).
+        error_msg = f"Ingest service returned {exc.response.status_code}: {exc.response.text[:300]}"
+        _update_job(job_id, status="failed", error=error_msg)
+        logger.error("[ingest_document_task] ❌ job_id=%s error=%s", job_id, error_msg)
+        raise self.retry(exc=exc)
+
     except Exception as exc:
         error_msg = str(exc)[:500]  # truncate to avoid huge DB values
         _update_job(job_id, status="failed", error=error_msg)
         logger.error("[ingest_document_task] ❌ job_id=%s error=%s", job_id, error_msg)
-
-        # Retry on transient errors (DB blips, embedding model loading issues)
-        # Don't retry if it's a ValueError (bad input — won't succeed on retry)
-        if not isinstance(exc, (ValueError, TypeError)):
-            raise self.retry(exc=exc)
-        raise
+        raise self.retry(exc=exc)

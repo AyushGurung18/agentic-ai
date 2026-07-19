@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+langchain-text-splitters
+langchain-huggingface
+langchain-postgres
+sentence-transformers
+psycopg[binary]
+psycopg-pool
+psycopg2-binary
+pgvector
+python-dotenv
+httpx
