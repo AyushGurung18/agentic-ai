@@ -1,10 +1,11 @@
 name: Deploy to Hugging Face Space
 
-# Keeps both HF Spaces in sync with GitHub main automatically — the same
-# image deploys to aayos/thotqen (SPACE_ROLE=api, FastAPI) and
-# aayos/thotqen-worker (SPACE_ROLE=worker, Celery), split into two Spaces
-# so the two processes aren't competing for RAM in one small container.
+# Keeps the aayos/thotqen HF Space in sync with GitHub main automatically.
 # HF Spaces don't pull from GitHub on their own — this pushes on every commit.
+#
+# Note: this Space runs FastAPI + Celery together (supervisord.conf). A
+# split into two Spaces was tried and reverted — HF's free tier only allows
+# one non-static Space per account; a second Docker Space needs PRO.
 
 on:
   push:
@@ -44,6 +45,3 @@ jobs:
 
           git remote add hf-space "https://aayos:${HF_TOKEN}@huggingface.co/spaces/aayos/thotqen"
           git push hf-space hf-deploy:main --force
-
-          git remote add hf-space-worker "https://aayos:${HF_TOKEN}@huggingface.co/spaces/aayos/thotqen-worker"
-          git push hf-space-worker hf-deploy:main --force
