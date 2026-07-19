@@ -36,7 +36,7 @@ RUN chmod +x /code/entrypoint.sh
 EXPOSE 7860
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-# entrypoint.sh picks supervisord.api.conf or supervisord.worker.conf based on
-# the SPACE_ROLE variable — same image, deployed to two separate HF Spaces so
-# FastAPI and Celery aren't competing for RAM in one small container.
+# entrypoint.sh picks supervisord.conf (FastAPI + Celery together, the
+# default) or supervisord.worker.conf (celery-only, currently unused — see
+# entrypoint.sh for why) based on the SPACE_ROLE variable.
 CMD ["/code/entrypoint.sh"]
