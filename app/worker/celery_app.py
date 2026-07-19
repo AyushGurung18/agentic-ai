@@ -8,7 +8,7 @@ Backend : rpc://          (stateless — job status is tracked in Supabase,
                            not in the Celery result backend, so rpc is fine)
 
 Worker start command:
-    celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+    celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
 
 Configuration notes:
   • acks_late=True          → message only ACK'd after task succeeds/fails,
@@ -71,6 +71,11 @@ celery_app.conf.update(
     # Reliability
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+
+    # Recycle the worker process every few tasks so memory fragmentation
+    # from repeated PDF/embedding runs doesn't creep up over a long-lived
+    # container uptime on a small, memory-constrained host.
+    worker_max_tasks_per_child=5,
 
     # Timeouts — 100-page PDFs take ~2-4 min to embed on CPU
     task_time_limit=600,        # hard kill at 10 min
