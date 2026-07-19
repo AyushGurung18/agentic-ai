@@ -609,18 +609,40 @@ def get_rag_graph(llm):
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+# Human-readable status per graph node, shown to the user while it runs
+# instead of a blind loading spinner. Keyed by the exact node names
+# registered below — a node with no entry here just doesn't surface a
+# status update (e.g. loop-only internal steps).
+NODE_STATUS_LABELS = {
+    "input_guardrail":  "Checking your question...",
+    "hyde_generator":   "Expanding your question for better retrieval...",
+    "retrieve":         "Retrieving relevant documents...",
+    "rerank_documents": "Ranking the most relevant passages...",
+    "grade_documents":  "Verifying the retrieved context...",
+    "rewrite_query":    "Refining the search and trying again...",
+    "web_search":       "Searching the web for more context...",
+    "generate":         "Generating your answer...",
+    "grade_generation": "Double-checking the answer for accuracy...",
+}
+
+
 @traceable(name="thotqen_rag_pipeline", run_type="chain")
 def run_rag_graph(
     question: str,
     session_id: str,
     user_id: str,
     llm,
-) -> str:
+):
     """
-    Run the Self-RAG + CRAG graph and return the final answer string.
+    Run the Self-RAG + CRAG graph, yielding real progress as it goes.
 
-    This is a synchronous, non-streaming call.
-    Streaming is handled by rag.py which calls this and yields tokens itself.
+    Uses LangGraph's own .stream() (not .invoke()) so each yielded status
+    reflects a node that has actually just finished — not a time-based
+    guess. Yields {"type": "status", "label": ...} after every node, and
+    finally {"type": "done", "answer": ...} once the graph reaches END.
+
+    rag.py's ask_question() consumes this generator and forwards the
+    status events to the frontend inline with the token stream.
     """
     # Load chat history from DB
     history_store = get_chat_history(session_id)
@@ -640,8 +662,15 @@ def run_rag_graph(
 
     graph = get_rag_graph(llm)
     started = time.perf_counter()
+    final_state = dict(initial_state)
     try:
-        final_state = graph.invoke(initial_state)
+        for step in graph.stream(initial_state):
+            for node_name, node_state in step.items():
+                if node_state:
+                    final_state.update(node_state)
+                label = NODE_STATUS_LABELS.get(node_name)
+                if label:
+                    yield {"type": "status", "label": label}
     except Exception:
         elapsed_ms = round((time.perf_counter() - started) * 1000)
         logger.warning(
@@ -660,5 +689,6 @@ def run_rag_graph(
         len(final_state.get("documents", [])), final_state.get("web_searched", False),
         len(final_state.get("generation", "")),
     )
+    yield {"type": "done", "answer": final_state.get("generation", "")}
 
     return final_state.get("generation", "I was unable to generate an answer.")
