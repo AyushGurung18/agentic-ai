@@ -30,10 +30,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application source + supervisord config ────────────────────────────────────
 COPY --chown=user . .
+RUN chmod +x /code/entrypoint.sh
 
 # ── Port ──────────────────────────────────────────────────────────────────────
 EXPOSE 7860
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
-# supervisord is PID 1; it launches both FastAPI and Celery as child processes.
-CMD ["supervisord", "-c", "/code/supervisord.conf"]
+# entrypoint.sh picks supervisord.api.conf or supervisord.worker.conf based on
+# the SPACE_ROLE variable — same image, deployed to two separate HF Spaces so
+# FastAPI and Celery aren't competing for RAM in one small container.
+CMD ["/code/entrypoint.sh"]
