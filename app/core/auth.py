@@ -24,6 +24,7 @@ Required .env keys
   SUPABASE_JWT_SECRET   → only needed for legacy HS256 projects
 """
 
+import logging
 import time
 from typing import Optional
 
@@ -34,6 +35,8 @@ from jose import jwt, JWTError, ExpiredSignatureError
 
 from app.core.config import SUPABASE_JWT_SECRET, SUPABASE_URL, DEV_USER_ID
 
+logger = logging.getLogger("auth")
+
 _bearer = HTTPBearer(auto_error=False)
 
 _JWKS_TTL_SECONDS = 3600
@@ -41,6 +44,9 @@ _jwks_cache: dict = {"keys": [], "fetched_at": 0.0}
 
 
 def _fetch_jwks(force: bool = False) -> list:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not configured — cannot reach the JWKS endpoint.")
+
     now = time.time()
     if force or not _jwks_cache["keys"] or (now - _jwks_cache["fetched_at"]) > _JWKS_TTL_SECONDS:
         resp = httpx.get(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json", timeout=10)
@@ -112,4 +118,15 @@ def get_current_user_id(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token.",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Network/config failure reaching Supabase's JWKS endpoint (bad
+        # SUPABASE_URL, DNS hiccup, Supabase outage, etc.) — this is not
+        # the caller's fault, so don't let it fall through as a raw 500.
+        logger.error("[auth] JWKS verification failed unexpectedly: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not verify authentication right now. Please try again shortly.",
         )
