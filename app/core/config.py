@@ -18,6 +18,7 @@ VLLM_API_KEY  = os.environ.get("VLLM_API_KEY", "not-needed")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTERAPIKEY", "")
 
 # Database
 # Strip SQLAlchemy driver prefix if present for compatibility
