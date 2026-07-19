@@ -297,13 +297,26 @@ def ask_question(
     logger.info("[RAG] intent=%s user=%s session=%s q=%s", intent, user_id, session_id, question[:80])
 
     try:
-        # Run the LangGraph graph (synchronous — returns full answer)
-        full_answer = run_rag_graph(
+        # run_rag_graph is now a generator: it yields {"type": "status", ...}
+        # after every graph node completes (real progress, not a blind
+        # spinner) and finally {"type": "done", "answer": ...}. Status
+        # events are wrapped in \x1e (ASCII Record Separator) markers so
+        # the frontend can pull them out of the token stream and show them
+        # as a live status line instead of appending them to the visible
+        # answer — \x1e never occurs in normal generated text, so it's a
+        # safe, unambiguous delimiter without needing a bigger protocol
+        # change (SSE event types, etc.) on either side.
+        full_answer = ""
+        for event in run_rag_graph(
             question=question,
             session_id=session_id,
             user_id=user_id,
             llm=llm,
-        )
+        ):
+            if event["type"] == "status":
+                yield f"\x1e{event['label']}\x1e"
+            elif event["type"] == "done":
+                full_answer = event["answer"]
     except Exception as e:
         error_answer = f"Error generating answer: {str(e)}"
         try:
