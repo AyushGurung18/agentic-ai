@@ -18,6 +18,7 @@ import os
 import logging
 import httpx
 import threading
+import concurrent.futures
 
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
@@ -25,9 +26,30 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
 from langsmith import traceable
 import langchain
 langchain.debug = False  # set True only when actively debugging chains
+
+# Some provider SDKs (ChatNVIDIA in particular — it exposes no timeout
+# parameter at all) can hang far longer than expected on a rate limit or
+# slow response, which defeats the whole point of chaining fallbacks: a
+# single stuck provider blocks the fallback from ever being tried. This
+# wraps any LLM in a hard, externally-enforced wall-clock cutoff so a
+# stuck call is abandoned (not waited on) and the next provider in the
+# .with_fallbacks() chain runs instead — independent of whatever timeout
+# behavior (or lack of one) that provider's own client library has.
+_TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-timeout")
+
+
+def _with_hard_timeout(llm, seconds: float, name: str):
+    def _invoke(input, config=None, **kwargs):
+        future = _TIMEOUT_EXECUTOR.submit(llm.invoke, input, config=config, **kwargs)
+        try:
+            return future.result(timeout=seconds)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"{name} did not respond within {seconds}s")
+    return RunnableLambda(_invoke, name=f"{name}_bounded")
 
 from app.services.chunking import hierarchical_chunk_text
 from app.services.vectorstore import VectorStore
@@ -125,36 +147,62 @@ def _get_vllm_llm(temperature: float) -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=VLLM_API_KEY,
         temperature=temperature,
+        request_timeout=12,
     )
 
 
 def get_llm_by_intent(intent: str):
-    """Returns an instantiated LLM based on intent."""
+    """Returns an LLM with automatic cross-provider fallback baked in.
+
+    Previously this picked exactly one provider (whichever key was
+    configured first) and invoke_with_retry() would retry ONLY that same
+    provider up to 4 times with growing backoff — so a rate-limited
+    provider got hammered again and again instead of the request moving
+    on, turning a single 429 into 30-45+ seconds of dead waiting per LLM
+    call. A full graph run can hit several LLM calls (routing, grading,
+    generation, hallucination/usefulness checks, possible rewrites), so
+    that compounded into multi-minute hangs and "origin_timeout" errors
+    at the edge — the timeout itself was never really the problem.
+
+    LangChain's .with_fallbacks() tries every configured provider in
+    priority order within a single invoke() call, moving to the next one
+    immediately on any failure instead of retrying the one that just
+    failed.
+    """
+    # 12s per provider: generous for a real successful call (cloud LLM
+    # calls typically land in 2-8s), tight enough that a stuck/rate-limited
+    # provider doesn't stall the whole fallback chain.
+    PROVIDER_TIMEOUT_S = 12
+
     if intent == "cheap":
-        # Prefer Gemini Flash, then Groq Llama 3.1 8B, then self-hosted vLLM
+        temperature = 0.1
+        candidates = []
         if GEMINI_API_KEY:
-            logger.info("🤖 Routing [CHEAP] -> Gemini 1.5 Flash")
-            return ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=0.1)
-        elif GROQ_API_KEY:
-            logger.info("🤖 Routing [CHEAP] -> Groq Llama 3.1 8B")
-            return ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.1, groq_api_key=GROQ_API_KEY)
-        else:
-            logger.info("🤖 Routing [CHEAP] -> Self-hosted vLLM (%s)", VLLM_MODEL)
-            return _get_vllm_llm(temperature=0.1)
+            candidates.append(("Gemini 1.5 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if GROQ_API_KEY:
+            candidates.append(("Groq Llama 3.1 8B", ChatGroq(model_name="llama-3.1-8b-instant", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
     else:
-        # Prefer Nvidia (Llama 70B), then Gemini Pro, then Groq 70B, then self-hosted vLLM
+        temperature = 0.2
+        candidates = []
         if NVIDIA_API_KEY:
-            logger.info("🤖 Routing [COMPLEX] -> Nvidia (meta/llama-3.1-70b-instruct)")
-            return ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=0.2)
-        elif GEMINI_API_KEY:
-            logger.info("🤖 Routing [COMPLEX] -> Gemini 1.5 Pro")
-            return ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=0.2)
-        elif GROQ_API_KEY:
-            logger.info("🤖 Routing [COMPLEX] -> Groq Llama 3.3 70B")
-            return ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.2, groq_api_key=GROQ_API_KEY)
-        else:
-            logger.info("🤖 Routing [COMPLEX] -> Self-hosted vLLM (%s)", VLLM_MODEL)
-            return _get_vllm_llm(temperature=0.2)
+            candidates.append(("Nvidia Llama 3.1 70B", ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=temperature)))
+        if GEMINI_API_KEY:
+            candidates.append(("Gemini 1.5 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if GROQ_API_KEY:
+            candidates.append(("Groq Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+
+    # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
+    candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
+
+    names = [n for n, _ in candidates]
+    logger.info("🤖 Routing [%s] -> %s (fallbacks: %s)", intent.upper(), names[0], ", ".join(names[1:]) or "none")
+
+    # Every candidate gets the hard external timeout regardless of whether
+    # it also has a native one set above — ChatNVIDIA has no native timeout
+    # parameter at all, so this is the only thing bounding it.
+    bounded = [_with_hard_timeout(llm, PROVIDER_TIMEOUT_S, name) for name, llm in candidates]
+    primary, fallbacks = bounded[0], bounded[1:]
+    return primary.with_fallbacks(fallbacks) if fallbacks else primary
 
 
 # ── Document ingestion (unchanged — also called by Celery worker) ──────────────

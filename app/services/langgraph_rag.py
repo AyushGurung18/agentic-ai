@@ -110,16 +110,24 @@ def _is_transient(exc: BaseException) -> bool:
     ))
 
 
-def invoke_with_retry(chain, inputs: dict, max_attempts: int = 4):
-    """Invoke a LangChain runnable with exponential backoff.
+def invoke_with_retry(chain, inputs: dict, max_attempts: int = 2):
+    """Invoke a LangChain runnable with a short backoff safety net.
 
-    Free-tier LLM APIs intermittently time out or rate-limit mid-graph —
-    a single transient failure on one node (e.g. a per-document relevance
-    grade) shouldn't kill an otherwise-successful multi-step run.
+    The LLM passed in (see get_llm_by_intent) already has every configured
+    provider chained via .with_fallbacks() — a rate limit or outage on one
+    provider is handled by moving to the next provider immediately, inside
+    a single chain.invoke() call. This retry is only a backstop for the
+    case where the *entire* fallback chain (including self-hosted vLLM,
+    the last resort) hits something genuinely transient — it used to be
+    4 attempts with up to 30s of backoff PER call, which multiplied
+    against every LLM call in a graph run (routing, grading, generation,
+    grade-generation, rewrites) into multi-minute hangs when a single
+    provider was rate-limited. Kept short and shallow on purpose now that
+    cross-provider fallback does the real resilience work.
     """
     @retry(
         stop=stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=1.5, min=2, max=30),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
         retry=retry_if_exception(_is_transient),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
