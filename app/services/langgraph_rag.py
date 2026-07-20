@@ -21,17 +21,11 @@ Graph topology
   rerank_documents        (BGE cross-encoder reranker, keep top-5)
     │
     ▼
-  grade_documents         (LLM grades each doc for relevance)
+  grade_documents         (LLM grades all docs for relevance in one call)
     │
-    ├──(all irrelevant + no web yet)──► web_search ──► generate
+    ├──(all irrelevant + no web yet)──► web_search ──► generate ──► END
     ├──(all irrelevant + web done)───► rewrite_query ──► retrieve
-    └──(some relevant)──────────────► generate
-                                          │
-                                          ▼
-                                    grade_generation
-                                          │
-                                    ├── (hallucination/unanswered) ──► rewrite_query
-                                    └── (done) ──► END
+    └──(some relevant)──────────────► generate ──► END
 
 Nodes
 ─────
@@ -39,11 +33,19 @@ Nodes
   hyde_generator    Generates a hypothetical answer to enrich the query embedding
   retrieve          Hybrid Search (RRF = BM25 + vector) + Parent chunk expansion
   rerank_documents  BGE cross-encoder reranker (bge-reranker-base) keeps top-5
-  grade_documents   LLM grades each doc as "yes" (relevant) or "no"
+  grade_documents   LLM grades all docs at once as relevant/not relevant
   rewrite_query     LLM rewrites question to improve retrieval
   web_search        DuckDuckGo (or Tavily if TAVILY_API_KEY set) — CRAG fallback
   generate          LLM generates answer using filtered docs + chat history
-  grade_generation  (1) hallucination check  (2) usefulness check
+
+  Self-RAG's post-generation grading (hallucination/usefulness check ->
+  automatic rewrite) was removed — it was the dominant source of latency
+  variance (confirmed live: the same query needing 0 vs 3 extra rounds
+  across runs, since "is this grounded" is an inherently fuzzier judgment
+  call than CRAG's per-document relevance check) without a proportionate
+  correctness win. CRAG's retrieval-quality loop (grade_documents ->
+  web_search/rewrite_query) stays — it's the cheaper, more reliable half
+  of the self-correction story.
 
 State schema
 ────────────
@@ -158,7 +160,6 @@ class GraphState(TypedDict, total=False):
     iterations:          int                       # loop guard
     web_searched:        bool                      # prevent duplicate web search
     _trigger_web_search: bool                      # internal routing flag set by grade_documents
-    _generation_grade:   str                       # internal routing flag set by grade_generation
     _input_flagged:      bool                      # set by input guardrail
 
 
@@ -463,68 +464,6 @@ def generate(state: GraphState, llm) -> GraphState:
     return {**state, "generation": answer}
 
 
-@traceable(name="grade_generation_selfrag", run_type="chain")
-def grade_generation(state: GraphState, llm) -> GraphState:
-    """
-    Grade the generation on two dimensions:
-      1. Grounded: is the answer supported by the documents? (hallucination check)
-      2. Useful:   does the answer actually address the original question?
-
-    Stores grading results in _generation_grade for routing.
-    """
-    if not state.get("generation"):
-        return {**state, "_generation_grade": "rewrite"}
-
-    # 1. Hallucination check
-    hallucination_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a fact-checker. Given a set of documents and an AI-generated answer, "
-         "determine if the answer is grounded in and supported by the documents.\n"
-         "Output ONLY 'yes' (grounded) or 'no' (hallucination). Single word only."),
-        ("human", "Documents:\n{documents}\n\nAnswer:\n{generation}"),
-    ])
-    hallucination_grader = hallucination_prompt | llm | StrOutputParser()
-
-    # Must match what generate() actually used (all documents, full text —
-    # see generate() above) or this check judges groundedness against
-    # evidence it was never shown. Confirmed live: this was truncated to
-    # the first 3 docs at 500 chars each while generate() saw all 5 in
-    # full, and the mismatch made grounded=False fire on every single
-    # attempt — including ones with a correct, genuinely-grounded answer
-    # — silently forcing 2 extra unnecessary iterations on every request.
-    doc_text = "\n---\n".join(d.page_content[:1500] for d in state["documents"])
-    grounded_raw = invoke_with_retry(hallucination_grader, {
-        "documents": doc_text or "No documents.",
-        "generation": state["generation"][:1500],
-    }).strip().lower()
-    # Lenient match — a model prefixing "yes" with extra words is still a
-    # "yes", not a hallucination. An exact-equality check here meant any
-    # non-bare-word response silently forced an unnecessary rewrite loop.
-    grounded = grounded_raw.startswith("yes")
-    logger.info("[grade_generation] grounded=%s (raw=%r)", grounded, grounded_raw[:50])
-
-    if not grounded and state["iterations"] < MAX_ITERATIONS:
-        return {**state, "_generation_grade": "rewrite"}
-
-    # 2. Usefulness check
-    usefulness_prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a QA evaluator. Does the following answer actually address the question?\n"
-         "Output ONLY 'yes' or 'no'. Single word only."),
-        ("human", "Question: {question}\n\nAnswer: {generation}"),
-    ])
-    usefulness_grader = usefulness_prompt | llm | StrOutputParser()
-    useful_raw = invoke_with_retry(usefulness_grader, {
-        "question": state["original_q"],
-        "generation": state["generation"][:1000],
-    }).strip().lower()
-    useful = useful_raw.startswith("yes")
-    logger.info("[grade_generation] useful=%s (raw=%r)", useful, useful_raw[:50])
-
-    if not useful and state["iterations"] < MAX_ITERATIONS:
-        return {**state, "_generation_grade": "rewrite"}
-
-    return {**state, "_generation_grade": "done"}
 
 
 # ── Routing functions ──────────────────────────────────────────────────────────
@@ -533,7 +472,7 @@ def route_after_grade_documents(state: GraphState) -> Literal["web_search", "rew
     """
     After grading docs:
       - No relevant docs + haven't web-searched yet → web_search (CRAG)
-      - No relevant docs + already web-searched → rewrite_query (Self-RAG)
+      - No relevant docs + already web-searched → rewrite_query (CRAG retry)
       - Some relevant docs → generate
       - Max iterations hit → force generate
     """
@@ -554,14 +493,6 @@ def route_after_grade_documents(state: GraphState) -> Literal["web_search", "rew
     return "generate"
 
 
-def route_after_grade_generation(state: GraphState) -> str:
-    grade = state.get("_generation_grade", "done")
-    if grade == "rewrite" and state["iterations"] < MAX_ITERATIONS:
-        logger.info("[route] Generation needs improvement → rewrite_query")
-        return "rewrite_query"
-    logger.info("[route] Generation accepted → END")
-    return END
-
 def route_after_input_guardrail(state: GraphState) -> str:
     if state.get("_input_flagged", False):
         return END
@@ -570,7 +501,12 @@ def route_after_input_guardrail(state: GraphState) -> str:
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
 def build_rag_graph(llm):
-    """Build and compile the LangGraph Self-RAG + CRAG graph for a given LLM."""
+    """Build and compile the LangGraph CRAG graph for a given LLM.
+
+    Was "Self-RAG + CRAG" — Self-RAG's post-generation grading (hallucination
+    + usefulness check -> automatic rewrite) was removed. See the module
+    docstring for why.
+    """
 
     # Bind llm into node functions via closures
     def _input_guardrail(state):   return input_guardrail(state, llm)
@@ -578,7 +514,6 @@ def build_rag_graph(llm):
     def _grade_documents(state):   return grade_documents(state, llm)
     def _rewrite_query(state):     return rewrite_query(state, llm)
     def _generate(state):          return generate(state, llm)
-    def _grade_generation(state):  return grade_generation(state, llm)
 
     graph = StateGraph(GraphState)
 
@@ -591,11 +526,10 @@ def build_rag_graph(llm):
     graph.add_node("rewrite_query",     _rewrite_query)
     graph.add_node("web_search",        web_search)
     graph.add_node("generate",          _generate)
-    graph.add_node("grade_generation",  _grade_generation)
 
     # Edges
     graph.add_edge(START, "input_guardrail")
-    
+
     graph.add_conditional_edges(
         "input_guardrail",
         route_after_input_guardrail,
@@ -604,7 +538,7 @@ def build_rag_graph(llm):
             END:              END,
         },
     )
-    
+
     graph.add_edge("hyde_generator",   "retrieve")
     graph.add_edge("retrieve",         "rerank_documents")
     graph.add_edge("rerank_documents", "grade_documents")
@@ -621,16 +555,7 @@ def build_rag_graph(llm):
 
     graph.add_edge("web_search",    "generate")
     graph.add_edge("rewrite_query", "retrieve")   # loop back after rewrite
-    graph.add_edge("generate",      "grade_generation")
-
-    graph.add_conditional_edges(
-        "grade_generation",
-        route_after_grade_generation,
-        {
-            "rewrite_query": "rewrite_query",
-            END:             END,
-        },
-    )
+    graph.add_edge("generate",      END)
 
     return graph.compile()
 
@@ -662,7 +587,6 @@ NODE_STATUS_LABELS = {
     "rewrite_query":    "Refining the search and trying again...",
     "web_search":       "Searching the web for more context...",
     "generate":         "Generating your answer...",
-    "grade_generation": "Double-checking the answer for accuracy...",
 }
 
 

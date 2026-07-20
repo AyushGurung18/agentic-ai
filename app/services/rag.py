@@ -319,10 +319,10 @@ def ask_question(
     user_id: str | None = None,
 ):
     """
-    Stream answer tokens via the LangGraph Self-RAG + CRAG graph.
+    Stream answer tokens via the LangGraph CRAG graph.
 
     Graph flow:
-      retrieve → grade_documents → [rewrite / web_search] → generate → grade_generation
+      retrieve → grade_documents → [rewrite / web_search] → generate
 
     After the graph completes, writes the Q&A pair to:
       • Semantic cache (Cloudflare KV via internal endpoint)
