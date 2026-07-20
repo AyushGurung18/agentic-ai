@@ -41,6 +41,17 @@ langchain.debug = False  # set True only when actively debugging chains
 # behavior (or lack of one) that provider's own client library has.
 _TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-timeout")
 
+# Per-provider hard cutoff. Was 12s — measured OpenRouter's free auto-router
+# directly (5 back-to-back calls) and got 0.8s, 1.1s, 3.0s, 5.9s, 14.6s: the
+# shared free pool routes to whatever model has room, and that 14.6s sample
+# alone exceeded the old 12s cutoff. With Gemini/Groq currently broken on
+# this account (quota exhaustion / org restriction — unrelated to timeouts),
+# OpenRouter is often the only live fallback left after NVIDIA rate-limits,
+# so it needs enough room to actually finish. 20s keeps a 5-candidate chain
+# (NVIDIA, Gemini, Groq, OpenRouter, vLLM) at a 100s worst case, still under
+# the edge Worker's 120s proxy timeout.
+PROVIDER_TIMEOUT_S = 20
+
 
 def _with_hard_timeout(llm, seconds: float, name: str):
     def _invoke(input, config=None, **kwargs):
@@ -147,7 +158,7 @@ def _get_vllm_llm(temperature: float) -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=VLLM_API_KEY,
         temperature=temperature,
-        request_timeout=12,
+        request_timeout=PROVIDER_TIMEOUT_S,
     )
 
 
@@ -163,7 +174,7 @@ def _get_openrouter_llm(temperature: float) -> ChatOpenAI:
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
         temperature=temperature,
-        request_timeout=12,
+        request_timeout=PROVIDER_TIMEOUT_S,
     )
 
 
@@ -185,11 +196,6 @@ def get_llm_by_intent(intent: str):
     immediately on any failure instead of retrying the one that just
     failed.
     """
-    # 12s per provider: generous for a real successful call (cloud LLM
-    # calls typically land in 2-8s), tight enough that a stuck/rate-limited
-    # provider doesn't stall the whole fallback chain.
-    PROVIDER_TIMEOUT_S = 12
-
     if intent == "cheap":
         temperature = 0.1
         candidates = []
