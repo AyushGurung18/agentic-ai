@@ -44,13 +44,18 @@ _TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_
 # Per-provider hard cutoff. Was 12s — measured OpenRouter's free auto-router
 # directly (5 back-to-back calls) and got 0.8s, 1.1s, 3.0s, 5.9s, 14.6s: the
 # shared free pool routes to whatever model has room, and that 14.6s sample
-# alone exceeded the old 12s cutoff. With Gemini/Groq currently broken on
-# this account (quota exhaustion / org restriction — unrelated to timeouts),
-# OpenRouter is often the only live fallback left after NVIDIA rate-limits,
-# so it needs enough room to actually finish. 20s keeps a 5-candidate chain
-# (NVIDIA, Gemini, Groq, OpenRouter, vLLM) at a 100s worst case, still under
-# the edge Worker's 120s proxy timeout.
-PROVIDER_TIMEOUT_S = 20
+# alone exceeded the old 12s cutoff.
+#
+# 18s, not 20s: get_llm_by_intent() below builds up to a 6-candidate chain
+# (OpenRouter appears twice — its auto-router draws a different model per
+# call, so a second draw is a real extra shot, not a wasted repeat), and a
+# single graph node's worst case is every candidate hitting this cutoff:
+# 6 x 20s = 120s would land EXACTLY on the edge Worker's 120s proxy
+# timeout with zero margin, relying on Groq/vLLM happening to fail fast
+# rather than actually being bounded by anything. 6 x 18s = 108s leaves
+# real headroom regardless of which providers are currently slow-to-fail
+# vs instant-to-fail.
+PROVIDER_TIMEOUT_S = 18
 
 
 def _with_hard_timeout(llm, seconds: float, name: str):
@@ -196,26 +201,39 @@ def get_llm_by_intent(intent: str):
     immediately on any failure instead of retrying the one that just
     failed.
     """
+    # Gemini is quota-exhausted and Groq is org-restricted on this account
+    # right now (both account-level, not per-model — confirmed by testing
+    # every model directly). They're kept in the chain since either could
+    # get fixed later, but demoted to the back: as long as they're broken,
+    # every request was burning up to a full PROVIDER_TIMEOUT_S waiting on
+    # each of them before ever reaching a provider that actually works.
+    # OpenRouter appears twice — its free auto-router hands back a
+    # different model per call (observed 5 different models in 5 calls),
+    # so a second draw is a real extra chance, not a wasted repeat.
     if intent == "cheap":
         temperature = 0.1
         candidates = []
-        if GEMINI_API_KEY:
-            candidates.append(("Gemini 1.5 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if OPENROUTER_API_KEY:
+            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
             candidates.append(("Groq Llama 3.1 8B", ChatGroq(model_name="llama-3.1-8b-instant", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
         if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free)", _get_openrouter_llm(temperature=temperature)))
+            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
+        if GEMINI_API_KEY:
+            candidates.append(("Gemini 1.5 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
     else:
         temperature = 0.2
         candidates = []
         if NVIDIA_API_KEY:
             candidates.append(("Nvidia Llama 3.1 70B", ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=temperature)))
-        if GEMINI_API_KEY:
-            candidates.append(("Gemini 1.5 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if OPENROUTER_API_KEY:
+            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
+        if OPENROUTER_API_KEY:
+            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
             candidates.append(("Groq Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
-        if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free)", _get_openrouter_llm(temperature=temperature)))
+        if GEMINI_API_KEY:
+            candidates.append(("Gemini 1.5 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
     candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))

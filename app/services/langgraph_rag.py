@@ -110,20 +110,22 @@ def _is_transient(exc: BaseException) -> bool:
     ))
 
 
-def invoke_with_retry(chain, inputs: dict, max_attempts: int = 2):
+def invoke_with_retry(chain, inputs: dict, max_attempts: int = 1):
     """Invoke a LangChain runnable with a short backoff safety net.
 
     The LLM passed in (see get_llm_by_intent) already has every configured
     provider chained via .with_fallbacks() — a rate limit or outage on one
     provider is handled by moving to the next provider immediately, inside
-    a single chain.invoke() call. This retry is only a backstop for the
-    case where the *entire* fallback chain (including self-hosted vLLM,
-    the last resort) hits something genuinely transient — it used to be
-    4 attempts with up to 30s of backoff PER call, which multiplied
-    against every LLM call in a graph run (routing, grading, generation,
-    grade-generation, rewrites) into multi-minute hangs when a single
-    provider was rate-limited. Kept short and shallow on purpose now that
-    cross-provider fallback does the real resilience work.
+    a single chain.invoke() call. Was max_attempts=2, meaning a full node
+    call could retry the *entire* multi-provider chain a second time from
+    scratch — worst case ~6 candidates x 20s each x 2 attempts = well over
+    the edge Worker's 120s proxy timeout, from a SINGLE graph node, of
+    which a full request runs through six. Retrying the whole chain again
+    also doesn't help against the failures actually being hit in practice
+    (Gemini quota exhaustion, Groq org-restriction) — those are
+    account-level, not transient, so a second pass 1-4s later fails the
+    same way. Left as a parameter (not deleted outright) in case a future
+    caller genuinely needs it for a truly transient case.
     """
     @retry(
         stop=stop_after_attempt(max_attempts),
