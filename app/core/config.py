@@ -19,6 +19,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTERAPIKEY", "")
+# Second accounts — the first Groq account is org-restricted and the first
+# Gemini account is quota-exhausted. Separate keys, not a replacement, so
+# both get tried before falling through to OpenRouter/vLLM.
+GROQ_API_KEY_2 = os.environ.get("GROQ_API_KEY_2", "")
+GEMINI_API_KEY_2 = os.environ.get("GEMINI_API_KEY_2", "")
 
 # Database
 # Strip SQLAlchemy driver prefix if present for compatibility
