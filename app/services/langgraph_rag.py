@@ -85,7 +85,12 @@ from sentence_transformers import CrossEncoder
 logger = logging.getLogger("langgraph_rag")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MAX_ITERATIONS = 3          # max retrieve→grade→rewrite loops before forcing generate
+MAX_ITERATIONS = 2          # max retrieve→grade→rewrite loops before forcing generate
+# Was 3 — confirmed live that a single request can need all 3 rounds
+# (144.75s) sitting uncomfortably close to the edge Worker's 200s proxy
+# timeout, while a repeat of the identical query often succeeds in 1
+# round (82.1s). Trading a little self-correction depth for a lower
+# worst-case ceiling: most requests never need more than 1 round anyway.
 RELEVANCE_THRESHOLD = 0.5   # fraction of relevant docs below which we trigger CRAG web search
 
 # ── Singletons ─────────────────────────────────────────────────────────────────
