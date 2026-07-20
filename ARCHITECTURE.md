@@ -8,7 +8,7 @@ This document provides a comprehensive breakdown of the **AI Knowledge Copilot**
 
 ![System architecture](docs/architecture_overview.png)
 
-Client → Cloudflare Worker edge gateway (CORS, semantic cache, R2 doc serving, reverse proxy with timeout/retry) → FastAPI backend → intent-routed multi-provider LLMs → LangGraph CRAG/Self-RAG pipeline → Postgres/pgvector + R2 storage, with every request fully traced through LangSmith and scored offline via a RAGAS eval harness.
+Client → Cloudflare Worker edge gateway (CORS, semantic cache, R2 doc serving, reverse proxy with timeout/retry) → FastAPI backend → intent-routed multi-provider LLM fallback chain → LangGraph CRAG pipeline → Postgres/pgvector + R2 storage, with every request fully traced through LangSmith and scored offline via a RAGAS eval harness.
 
 <details>
 <summary>Mermaid source (editable)</summary>
@@ -27,7 +27,7 @@ flowchart LR
     subgraph API["FastAPI · thotqen (HF Spaces)"]
         direction TB
         Endpoints["/upload · /chat\n/api/admin/metrics"]
-        Intent{"route_intent\ncheap / complex"}
+        Intent{"route_intent\nfast Groq call classifies\ncheap vs complex"}
     end
 
     subgraph Async["Async Ingestion"]
@@ -36,9 +36,9 @@ flowchart LR
         Chunk["Hierarchical chunk\n→ local MiniLM embed"]
     end
 
-    LLMs["Multi-Provider LLMs\ncheap: Gemini → Groq → vLLM\ncomplex: NVIDIA → Gemini → Groq → vLLM"]
+    LLMs["Multi-Provider Fallback Chain\ncomplex: NVIDIA → Groq#2 → Gemini#2\n→ OpenRouter ×2 → Groq#1 → Gemini#1 → vLLM\ncheap: same, minus NVIDIA\n18s hard cutoff per provider"]
 
-    RAG["LangGraph Pipeline\nCRAG + Self-RAG\n(guardrail → HyDE → hybrid retrieve\n→ rerank → grade → generate → grade)"]
+    RAG["LangGraph Pipeline · CRAG\nguardrail → HyDE → hybrid retrieve\n→ rerank → batched grade\n→ [web search / rewrite] → generate"]
 
     subgraph Store["Storage"]
         direction TB
@@ -98,13 +98,14 @@ flowchart LR
 
 ### 4. AI / ML / Observability
 - **Intent Router**: A fast/cheap model classifies each query as `cheap` or `complex` before routing.
-- **Cheap tier**: Gemini 2.5 Flash → Groq Llama 3.1 8B → self-hosted vLLM (PagedAttention) fallback.
-- **Complex tier**: NVIDIA-hosted Llama 3.1 70B → Gemini 2.5 Pro → Groq Llama 3.3 70B → self-hosted vLLM fallback.
+- **Complex tier**: NVIDIA-hosted Llama 3.1 70B → Groq (2nd account) Llama 3.3 70B → Gemini (2nd account) 2.5 Pro → OpenRouter free auto-router (tried twice — a different free model per draw) → Groq (1st account) → Gemini (1st account) → self-hosted vLLM.
+- **Cheap tier**: same chain, minus the NVIDIA hop — Groq (2nd account) Llama 3.1 8B first.
+- Each provider is wrapped in a hard 18s cutoff enforced externally via a `ThreadPoolExecutor` (`ChatNVIDIA` in particular exposes no timeout of its own), so a stuck provider can't stall the whole fallback chain.
 - **Embeddings**: `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim).
 - **Reranker**: `BAAI/bge-reranker-base` (local BGE cross-encoder).
 - **CRAG web fallback**: Tavily (DuckDuckGo fallback if no `TAVILY_API_KEY`).
-- **Resilience**: every LLM call in the graph is wrapped in exponential-backoff retry (tenacity) — a transient timeout/rate-limit on one node doesn't kill the whole run.
-- **LangSmith**: Every node in the graph carries a named `@traceable` span — a full request renders as one readable trace tree (guardrail → HyDE → retrieve → rerank → grade → generate → grade), not scattered LLM calls.
+- **Resilience — cross-provider, not same-provider retry**: `.with_fallbacks()` moves to the next provider immediately on any failure within one call. A same-chain retry loop used to sit on top of this too (up to 4 attempts historically) — measured live that it just re-hit an already-exhausted chain for account-level failures (quota/org-restriction) without helping, while multiplying worst-case latency, so it was cut to a single pass per call.
+- **LangSmith**: Every node in the graph carries a named `@traceable` span — a full request renders as one readable trace tree (guardrail → HyDE → retrieve → rerank → grade → generate), not scattered LLM calls.
 - **RAGAS**: Offline eval harness (`scripts/generate_testset.py` + `scripts/run_evals.py`) scoring Context Precision, Context Recall, Answer Relevancy, and Faithfulness against a synthetic testset generated from real ingested documents.
 - **Live admin dashboard**: `GET /api/admin/metrics` pulls real run counts, success rate, latency, and token usage straight from the LangSmith API.
 
@@ -125,9 +126,9 @@ flowchart LR
 
 ---
 
-## 🤖 Query Pipeline (LangGraph — CRAG + Self-RAG)
+## 🤖 Query Pipeline (LangGraph — CRAG)
 
-Every user question flows through a stateful graph, fully traced in LangSmith node-by-node:
+Every user question is first classified by the intent router, then flows through a stateful graph, fully traced in LangSmith node-by-node:
 
 ![LangGraph pipeline detail](docs/pipeline_detail.png)
 
@@ -136,24 +137,27 @@ Every user question flows through a stateful graph, fully traced in LangSmith no
 
 ```mermaid
 flowchart TD
-    START(["User question"]) --> IG["input_guardrail\nLLM safety check"]
-    IG -- flagged --> BLOCKED(["Request blocked"])
+    START(["User question"]) --> INTENT{"route_intent\nfast LLM call classifies:\ncheap or complex?"}
+    INTENT -- "cheap\n(greeting, simple fact)" --> CHAINC["LLM fallback chain — cheap\nGroq #2 → Gemini #2 → OpenRouter ×2\n→ Groq #1 → Gemini #1 → vLLM\n(18s hard cutoff per provider)"]
+    INTENT -- "complex\n(reasoning, synthesis)" --> CHAINX["LLM fallback chain — complex\nNVIDIA → Groq #2 → Gemini #2 → OpenRouter ×2\n→ Groq #1 → Gemini #1 → vLLM\n(18s hard cutoff per provider)"]
+    CHAINC --> IG
+    CHAINX --> IG
+    IG["input_guardrail\nLLM safety check"] -- flagged --> BLOCKED(["Request blocked"])
     IG -- safe --> HYDE["hyde_generator\nhypothetical answer for recall"]
     HYDE --> RET["retrieve\nhybrid search: BM25 + HNSW vector → RRF"]
     RET --> RERANK["rerank_documents\nBGE cross-encoder, keep top-5"]
-    RERANK --> GRADE{"grade_documents\nCRAG relevance check"}
-    GRADE -- "all irrelevant\nno web search yet" --> WEB["web_search\nTavily (DuckDuckGo fallback)"]
-    GRADE -- "all irrelevant\nweb already tried" --> RW1["rewrite_query"]
-    GRADE -- "some relevant" --> GEN["generate\nanswer from filtered context"]
+    RERANK --> GRADE{"grade_documents\n1 batched LLM call grades\nALL docs at once\nrelevant ratio < 50%?"}
+    GRADE -- "below 50%,\nno web search yet" --> WEB["web_search\nTavily (DuckDuckGo fallback)"]
+    GRADE -- "below 50%,\nweb already tried" --> RW1["rewrite_query\nLLM rephrases the question"]
+    GRADE -- "50%+ relevant" --> GEN["generate\nanswer from filtered context\n+ chat history"]
     WEB --> GEN
-    RW1 --> RET
-    GEN --> GG{"grade_generation\nSelf-RAG: grounded? useful?"}
-    GG -- "hallucinated or\nunhelpful, under 3 loops" --> RW2["rewrite_query"]
-    GG -- "grounded + useful" --> DONE(["Final answer"])
-    RW2 --> RET
+    RW1 -- "loop back\n(max 2 rounds total)" --> RET
+    GEN --> DONE(["Final answer\nstreamed to user"])
 ```
 
 </details>
+
+> **Why no Self-RAG grading loop?** An earlier version graded every generated answer for groundedness/usefulness and auto-rewrote on failure. Measured live: the same query against the same document needed 0 extra rounds on one run and 3 on another — grading "is this answer grounded" is a much fuzzier judgment call than CRAG's per-document relevance check, and it was the dominant source of latency variance (up to ~145s on a bad run) without a proportionate correctness win. Removed outright; CRAG's cheaper, more predictable retrieval-quality loop stays.
 
 ### Hybrid Search (RRF)
 The `hybrid_search` PostgreSQL function combines:
@@ -202,4 +206,5 @@ When a child chunk is retrieved, its **parent chunk** content is returned to the
 6. **Offline Evals as a Regression Gate**: RAGAS metrics are run on demand via a script, not inline, to keep request latency minimal — the goal is catching quality regressions before merge, not proving a fabricated improvement delta on every change.
 7. **Pro-Grade Observability**: Using LangSmith, the LangGraph execution is fully traced — every node, LLM call, token count, and latency metric is logged to a central dashboard.
 8. **Live Admin Telemetry**: `GET /api/admin/metrics` queries the LangSmith API directly and feeds a live dashboard — real numbers, not static claims.
-9. **Resilience by Design**: every LLM call in the graph retries with exponential backoff on transient failures (timeouts, 429s, 5xxs), and the pipeline degrades gracefully — an honest "I don't know" instead of a hallucination when retrieval or grading can't complete.
+9. **Resilience by Design**: every LLM call goes through a cross-provider fallback chain with a hard per-provider timeout, so a stuck or rate-limited provider can't stall the request — moving to the next provider immediately, not retrying the same one. The pipeline degrades gracefully — an honest "I don't know" instead of a hallucination when retrieval genuinely can't find relevant context.
+10. **Cutting a Grading Step That Didn't Earn Its Latency Cost**: Self-RAG's post-generation grounded/useful check was removed after measuring it live — it was an inherently fuzzier judgment call than CRAG's document-relevance check, and the dominant source of run-to-run latency variance, without a proportionate correctness win. Good engineering sometimes means deleting a feature once the data says it isn't pulling its weight.

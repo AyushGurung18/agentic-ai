@@ -12,7 +12,7 @@ A highly optimized, production-ready Retrieval-Augmented Generation (RAG) system
 
 ![System architecture](docs/architecture_overview.png)
 
-Full breakdown — including the detailed CRAG/Self-RAG pipeline diagram — in [ARCHITECTURE.md](ARCHITECTURE.md).
+Full breakdown — including the detailed CRAG pipeline diagram — in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
@@ -20,12 +20,12 @@ Full breakdown — including the detailed CRAG/Self-RAG pipeline diagram — in 
 
 Unlike basic "tutorial-grade" RAG systems, **Thotqen** implements advanced optimization patterns to handle production scale:
 
-### 1. Stateful Self-RAG & CRAG Graph ([langgraph_rag.py](file:///home/ayush/.dev/bbygrl/thotqen/app/services/langgraph_rag.py))
+### 1. Stateful CRAG Graph ([langgraph_rag.py](file:///home/ayush/.dev/bbygrl/thotqen/app/services/langgraph_rag.py))
 Built on **LangGraph**, the pipeline manages a complex routing topology that incorporates:
 *   **Input Guardrails:** Early classification to block prompt injection and toxic queries.
 *   **HyDE (Hypothetical Document Embeddings):** Generates hypothetical answers to bridge the semantic gap between questions and document chunks.
-*   **Corrective RAG (CRAG) Fallback:** Integrates live web search (Tavily/DuckDuckGo) when the local knowledge base yields insufficient document scores.
-*   **Self-RAG Loops:** Evaluates generated answers for hallucinations (groundedness) and query alignment (usefulness), triggering automatic query-rewrites if thresholds aren't met.
+*   **Corrective RAG (CRAG) Fallback:** A single batched LLM call grades every retrieved document's relevance at once; below a 50% relevant ratio, it falls back to live web search (Tavily/DuckDuckGo) or rewrites the query and retries (capped at 2 rounds).
+*   *(A Self-RAG post-generation grounded/useful check previously sat after `generate` — removed after measuring it as the dominant source of latency variance for a judgment call fuzzier than CRAG's document grading, without a proportionate correctness win.)*
 
 ### 2. Hierarchical (Parent-Child) Chunking ([chunking.py](file:///home/ayush/.dev/bbygrl/thotqen/app/services/chunking.py))
 *   **The Problem:** Large chunks dilute semantic vector representation. Tiny chunks lack the context necessary for an LLM to generate high-quality answers.
@@ -38,10 +38,11 @@ Uses a custom database-level function `hybrid_search()` to run:
 *   **Fusion:** Fuses ranks using the **RRF formula** ($Score = \sum \frac{1}{60 + rank}$), catching exact terms (codes, IDs) and semantic meaning without needing complex score-normalization.
 
 ### 4. Intent Routing ([rag.py](file:///home/ayush/.dev/bbygrl/thotqen/app/services/rag.py))
-*   Routes incoming queries through a cheap classifier (`llama-3.1-8b-instant`).
-*   **Cheap/Factual Queries** are handled by high-throughput models: `gemini-2.5-flash` → Groq Llama 3.1 8B → self-hosted vLLM (PagedAttention) fallback.
-*   **Complex/Reasoning Queries** are routed to `meta/llama-3.1-70b-instruct` (Nvidia API) → `gemini-2.5-pro` → Groq Llama 3.3 70B → vLLM fallback. This reduces average API costs by up to 80%.
-*   Every LLM call in the graph retries with exponential backoff on transient timeouts/rate-limits (tenacity), and every node is traced in LangSmith as a named span.
+*   Routes incoming queries through a cheap classifier (`llama-3.1-8b-instant`) that labels each one `cheap` or `complex`.
+*   **Complex/Reasoning Queries**: `meta/llama-3.1-70b-instruct` (NVIDIA) → Groq Llama 3.3 70B (2nd account) → Gemini 2.5 Pro (2nd account) → OpenRouter's free auto-router (tried twice) → Groq (1st account) → Gemini (1st account) → self-hosted vLLM.
+*   **Cheap/Factual Queries**: same chain, minus the NVIDIA hop.
+*   Two accounts each for Groq/Gemini because the first of each hit a real account-level restriction (org restriction, quota exhaustion) — rather than block on fixing that, the second account is tried first and the first is kept further down the chain in case it recovers.
+*   Every provider gets a hard 18s cutoff enforced externally (not every provider's SDK honors its own `timeout` param — `ChatNVIDIA` exposes none at all), and `.with_fallbacks()` moves to the next provider immediately on any failure — no same-provider retry loop sitting on top and multiplying worst-case latency. Every node is traced in LangSmith as a named span.
 
 ### 5. Local BGE Reranking
 *   Employs a local `BAAI/bge-reranker-base` cross-encoder to evaluate the retrieved document list.
@@ -57,7 +58,7 @@ Uses a custom database-level function `hybrid_search()` to run:
 *   Used as a regression gate, not a fabricated improvement claim — rerun after any retrieval/reranking/prompt change and diff against the last snapshot.
 
 ### 8. Full LangSmith Observability
-*   Every node in the LangGraph pipeline (`input_guardrail`, `hyde_generator`, `retrieve`, `rerank_documents`, `grade_documents`, `web_search`, `generate`, `grade_generation`) carries a named `@traceable` span, so a full request renders as one readable trace tree.
+*   Every node in the LangGraph pipeline (`input_guardrail`, `hyde_generator`, `retrieve`, `rerank_documents`, `grade_documents`, `web_search`, `generate`) carries a named `@traceable` span, so a full request renders as one readable trace tree.
 *   `GET /api/admin/metrics` queries the LangSmith API directly (`total_runs`, `success_rate`, `avg_latency_ms`, `total_tokens`, recent trace activity) — a live admin dashboard, not static numbers.
 
 ---
@@ -67,7 +68,7 @@ Uses a custom database-level function `hybrid_search()` to run:
 *   **Orchestration & Workflow:** LangGraph, Celery
 *   **Vector Database:** Supabase PostgreSQL with `pgvector` & HNSW indexing
 *   **Embeddings:** Local SentenceTransformers (`all-MiniLM-L6-v2` / 384-dim)
-*   **LLMs:** Gemini 2.5 (Flash/Pro), Llama 3.x (Groq & NVIDIA AI Endpoints), self-hosted vLLM (PagedAttention) as the no-API-key fallback
+*   **LLMs:** Gemini 2.5 Pro (2 accounts), Llama 3.x (Groq — 2 accounts, & NVIDIA AI Endpoints), OpenRouter free auto-router, self-hosted vLLM (PagedAttention) as the no-API-key last resort
 *   **Observability:** LangSmith (full tracing), RAGAS (offline eval)
 *   **Hosting:** Dockerized deployment optimized for Hugging Face Spaces
 
@@ -81,6 +82,9 @@ SECRET_KEY=your_auth_secret
 GROQ_API_KEY=gsk_...
 GEMINI_API_KEY=AIzaSy...
 NVIDIA_API_KEY=nvapi-...
+GROQ_API_KEY_2=gsk_...        # optional — 2nd account, tried before the 1st
+GEMINI_API_KEY_2=AIzaSy...    # optional — 2nd account, tried before the 1st
+OPENROUTERAPIKEY=sk-or-v1-... # optional — free auto-router, tried twice per request
 TAVILY_API_KEY=tvly-...
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=lsv2_pt_...
