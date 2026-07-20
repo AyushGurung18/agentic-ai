@@ -298,33 +298,54 @@ def rerank_documents(state: GraphState) -> GraphState:
 @traceable(name="grade_documents_crag", run_type="chain")
 def grade_documents(state: GraphState, llm) -> GraphState:
     """
-    Grade each retrieved document for relevance.
+    Grade all retrieved documents for relevance in a single LLM call.
     Irrelevant docs are filtered out.
     Sets web_searched flag trigger if relevance ratio < RELEVANCE_THRESHOLD.
+
+    Was one LLM call PER document (up to 5, per CRAG/Self-RAG iteration,
+    up to MAX_ITERATIONS=3 iterations — 15 grading calls alone in the
+    worst case). Confirmed live this was a major latency contributor
+    (single requests taking 2.5+ minutes). Batching into one call cuts
+    this node from up to 5 calls down to 1.
     """
     if not state["documents"]:
         logger.info("[grade_documents] No docs to grade — triggering web search")
         return {**state, "documents": [], "web_searched": False}
 
+    docs = state["documents"]
     grade_prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a grader assessing relevance of a retrieved document to a user question.\n"
-         "Output ONLY 'yes' if the document contains information relevant to the question, "
-         "or 'no' if it does not.\n"
-         "Do NOT explain. Single word answer only."),
-        ("human", "Question: {question}\n\nDocument:\n{document}"),
+         "You are a grader assessing relevance of retrieved documents to a user question.\n"
+         "You will be given N numbered documents. For EACH one, decide if it contains "
+         "information relevant to the question.\n"
+         "Output ONLY a comma-separated list of yes/no values, one per document, in order, "
+         "and nothing else. Example for 3 documents: yes,no,yes"),
+        ("human", "Question: {question}\n\nDocuments:\n{documents}"),
     ])
     grader = grade_prompt | llm | StrOutputParser()
 
-    relevant_docs = []
-    for doc in state["documents"]:
-        score = invoke_with_retry(grader, {
-            "question": state["question"],
-            "document": doc.page_content[:2000],  # truncate for grader
-        }).strip().lower()
-        logger.debug("[grade_documents] doc='%s...' → %s", doc.page_content[:60], score)
-        if score == "yes":
-            relevant_docs.append(doc)
+    numbered = "\n\n".join(
+        f"[{i + 1}] {doc.page_content[:2000]}" for i, doc in enumerate(docs)
+    )
+    raw = invoke_with_retry(grader, {"question": state["question"], "documents": numbered})
+    # Lenient parsing: a model padding "yes" with extra words (very common
+    # even under a "single word only" instruction, especially on weaker
+    # fallback models) shouldn't be treated the same as an actual "no".
+    verdicts = [v.strip().lower().startswith("yes") for v in raw.split(",")]
+
+    if len(verdicts) != len(docs):
+        # Malformed/unparseable response — fail open (keep everything)
+        # rather than risk dropping every document over a formatting
+        # miss, which is what silently pushed CRAG into an unnecessary
+        # web-search fallback before this fix.
+        logger.warning(
+            "[grade_documents] Grader returned %d verdicts for %d docs — keeping all. raw=%r",
+            len(verdicts), len(docs), raw[:200],
+        )
+        relevant_docs = docs
+    else:
+        relevant_docs = [doc for doc, keep in zip(docs, verdicts) if keep]
+        logger.debug("[grade_documents] verdicts=%s", verdicts)
 
     total = len(state["documents"])
     kept  = len(relevant_docs)
@@ -459,14 +480,25 @@ def grade_generation(state: GraphState, llm) -> GraphState:
     ])
     hallucination_grader = hallucination_prompt | llm | StrOutputParser()
 
-    doc_text = "\n---\n".join(d.page_content[:500] for d in state["documents"][:3])
-    grounded = invoke_with_retry(hallucination_grader, {
+    # Must match what generate() actually used (all documents, full text —
+    # see generate() above) or this check judges groundedness against
+    # evidence it was never shown. Confirmed live: this was truncated to
+    # the first 3 docs at 500 chars each while generate() saw all 5 in
+    # full, and the mismatch made grounded=False fire on every single
+    # attempt — including ones with a correct, genuinely-grounded answer
+    # — silently forcing 2 extra unnecessary iterations on every request.
+    doc_text = "\n---\n".join(d.page_content[:1500] for d in state["documents"])
+    grounded_raw = invoke_with_retry(hallucination_grader, {
         "documents": doc_text or "No documents.",
-        "generation": state["generation"][:1000],
+        "generation": state["generation"][:1500],
     }).strip().lower()
-    logger.info("[grade_generation] grounded=%s", grounded)
+    # Lenient match — a model prefixing "yes" with extra words is still a
+    # "yes", not a hallucination. An exact-equality check here meant any
+    # non-bare-word response silently forced an unnecessary rewrite loop.
+    grounded = grounded_raw.startswith("yes")
+    logger.info("[grade_generation] grounded=%s (raw=%r)", grounded, grounded_raw[:50])
 
-    if grounded != "yes" and state["iterations"] < MAX_ITERATIONS:
+    if not grounded and state["iterations"] < MAX_ITERATIONS:
         return {**state, "_generation_grade": "rewrite"}
 
     # 2. Usefulness check
@@ -477,13 +509,14 @@ def grade_generation(state: GraphState, llm) -> GraphState:
         ("human", "Question: {question}\n\nAnswer: {generation}"),
     ])
     usefulness_grader = usefulness_prompt | llm | StrOutputParser()
-    useful = invoke_with_retry(usefulness_grader, {
+    useful_raw = invoke_with_retry(usefulness_grader, {
         "question": state["original_q"],
         "generation": state["generation"][:1000],
     }).strip().lower()
-    logger.info("[grade_generation] useful=%s", useful)
+    useful = useful_raw.startswith("yes")
+    logger.info("[grade_generation] useful=%s (raw=%r)", useful, useful_raw[:50])
 
-    if useful != "yes" and state["iterations"] < MAX_ITERATIONS:
+    if not useful and state["iterations"] < MAX_ITERATIONS:
         return {**state, "_generation_grade": "rewrite"}
 
     return {**state, "_generation_grade": "done"}
