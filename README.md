@@ -12,6 +12,18 @@ A web app for analysing legal contracts. Upload a PDF or DOCX contract, ask ques
 
 Backend: this repo (`agentic-ai`), FastAPI + LangGraph. Frontend: a separate Next.js app (`bbygrl`, in the sibling directory) — see [Running locally](#running-locally) for both.
 
+**Live app:** https://agentic-ai-application.ayushgurung.com/
+
+## Screenshots
+
+| Upload / library | Chat with verified quotes |
+|---|---|
+| ![Document library](docs/screenshots/upload-library.png) | ![Chat with verified quotes](docs/screenshots/chat-verified-quotes.png) |
+
+| Citation highlighting | Document comparison |
+|---|---|
+| ![Citation highlighting](docs/screenshots/citation-highlighting.png) | ![Document comparison](docs/screenshots/document-comparison.png) |
+
 ## What it does
 
 - **Upload** a PDF or DOCX contract. Other file types are rejected with a clear message. A scanned PDF with no extractable text is rejected explicitly (not silently saved as empty). Processing runs in the background with live progress, not a blind spinner.
@@ -37,7 +49,7 @@ Documents are chunked hierarchically (large parent chunks for context, small chi
 
 Chosen over tracked-change redlining because it builds directly on infrastructure already in this codebase (the live per-step status streaming), while redlining is an unrelated OOXML-manipulation problem with nothing to build on. Toggle "research mode" in a single-document chat to enable it.
 
-Implementation notes: rather than native provider function-calling (inconsistent across the multi-provider fallback chain this app uses — Groq/Gemini/NVIDIA/OpenRouter/self-hosted vLLM — and not exposed through LangChain's fallback wrapper anyway), tool calls are parsed from a hand-rolled `TOOL_CALL: {...}` / `FINAL_ANSWER: ...` protocol (`app/services/agent_research.py`). This also means malformed/invented tool calls (bad JSON, unknown tool name, wrong argument types) are handled by construction — they become an error string fed back to the model, never a crash. Hard-capped at 6 rounds. The final answer goes through the same quote-verification pipeline as the standard chat path.
+Implementation notes: rather than native provider function-calling (inconsistent across the multi-provider fallback chain this app uses — Groq/Gemini/OpenRouter/self-hosted vLLM — and unreliable even where supported: Groq's gpt-oss models have a confirmed bug where they attempt a native tool call even when none is declared), tool calls are parsed from a hand-rolled `TOOL_CALL: {...}` / `FINAL_ANSWER: ...` protocol (`app/services/agent_research.py`). This also means malformed/invented tool calls (bad JSON, unknown tool name, wrong argument types) are handled by construction — they become an error string fed back to the model, never a crash. Hard-capped at 6 rounds. The final answer goes through the same quote-verification pipeline as the standard chat path.
 
 **Hardest part / what's weakest:** clause/section detection (`detect_clauses` in `agent_research.py`) is a regex heuristic over common contract heading shapes (numbered clauses, "Section N", ALL-CAPS headings) — it isn't a real document-structure parser, so `list_clauses()`/`get_section()` can miss or mis-split sections in a contract with an unusual heading style. `search_document` doesn't have this limitation (it's the same hybrid search used everywhere else).
 
@@ -53,7 +65,7 @@ Implementation notes: rather than native provider function-calling (inconsistent
 
 ## Tech stack
 
-FastAPI (Python) + LangGraph for the backend; Next.js (React) for the frontend (`../bbygrl`). PostgreSQL (Supabase) with `pgvector` for hybrid search. Celery + RabbitMQ for background document ingestion. Any OpenAI-compatible/Groq/Gemini/NVIDIA provider for the LLM, read from environment variables — see `app/core/config.py`. PDF parsing via PyMuPDF, DOCX via `python-docx` (server) and `mammoth` (client-side rendering for the viewer).
+FastAPI (Python) + LangGraph for the backend; Next.js (React) for the frontend (`../bbygrl`). PostgreSQL (Supabase) with `pgvector` for hybrid search. Celery + RabbitMQ for background document ingestion. Groq, Gemini, OpenRouter and a self-hosted vLLM server chained as automatic fallbacks for the LLM, read from environment variables — see `app/core/config.py`. PDF parsing via PyMuPDF, DOCX via `python-docx` (server) and `mammoth` (client-side rendering for the viewer).
 
 ## Running locally
 
