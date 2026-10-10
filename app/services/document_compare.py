@@ -3,13 +3,13 @@ app/services/document_compare.py
 ───────────────────────────────────
 Part B #7: document comparison.
 
-Diffs two document versions at paragraph level (difflib.SequenceMatcher
-over the paragraph list, not characters — a single word changing inside a
-2000-character paragraph doesn't fragment into dozens of tiny diff hunks),
-then asks the model to classify each changed paragraph pair in plain
-language and rate how significant the change is — explicitly distinguishing
-a reworded sentence from a substantive change (e.g. a liability cap moving
-from one figure to another), per the spec's own example.
+Diffs two document versions at clause/paragraph level (difflib.SequenceMatcher
+over a list of segments, not characters — a single word changing inside a
+2000-character clause doesn't fragment into dozens of tiny diff hunks), then
+asks the model to classify each changed pair in plain language and rate how
+significant the change is — explicitly distinguishing a reworded sentence
+from a substantive change (e.g. a liability cap moving from one figure to
+another), per the spec's own example.
 """
 
 import difflib
@@ -20,14 +20,35 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from app.services.langgraph_rag import invoke_with_retry
+from app.services.clause_detection import detect_clauses
 
 logger = logging.getLogger("document_compare")
 
 SIGNIFICANCE_LEVELS = ("minor", "moderate", "major")
 
 
-def _paragraphs(text: str) -> list[str]:
-    return [p.strip() for p in text.split("\n\n") if p.strip()]
+def _segments(text: str) -> list[str]:
+    """Split into clause-level segments using detected headings when
+    possible — confirmed live that PDF extraction (PyMuPDF's
+    get_text("text")) puts a single "\\n" between essentially every line
+    and never a blank line between paragraphs, so a naive "\\n\\n" split
+    collapsed an entire multi-clause contract into one or two "paragraphs",
+    diffing the whole document as a single giant changed block instead of
+    clause-level changes. Falls back to blank-line paragraphs (python-docx
+    extraction genuinely does join paragraphs with "\\n\\n" — see
+    docx_loader.py) or, as a last resort, individual non-empty lines, for a
+    document with no detectable heading structure at all.
+    """
+    clauses = detect_clauses(text)
+    if len(clauses) >= 2:
+        segments = [text[c["char_start"]:c["char_end"]].strip() for c in clauses]
+        return [s for s in segments if s]
+
+    blank_line_paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if len(blank_line_paras) >= 2:
+        return blank_line_paras
+
+    return [line.strip() for line in text.split("\n") if line.strip()]
 
 
 def _classify_changes(pairs: list[dict], llm) -> list[dict]:
@@ -87,8 +108,8 @@ def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str
       {type: "added"|"removed"|"modified", before, after, summary, significance}
     sorted major → minor so the most substantive changes surface first.
     """
-    paras_a = _paragraphs(text_a)
-    paras_b = _paragraphs(text_b)
+    paras_a = _segments(text_a)
+    paras_b = _segments(text_b)
 
     matcher = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
     opcodes = matcher.get_opcodes()
@@ -146,7 +167,7 @@ def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str
     return {
         "document_a": filename_a,
         "document_b": filename_b,
-        "total_paragraphs_a": len(paras_a),
-        "total_paragraphs_b": len(paras_b),
+        "total_segments_a": len(paras_a),
+        "total_segments_b": len(paras_b),
         "changes": changes,
     }

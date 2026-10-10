@@ -51,40 +51,12 @@ from langsmith import traceable
 from app.services.langgraph_rag import invoke_with_retry, QUOTE_MARK
 from app.services.embeddings import embed_text
 from app.services.quote_annotator import DocRef as DocumentRef
+from app.services.clause_detection import detect_clauses
 from app.db.database import get_conn
 
 logger = logging.getLogger("agent_research")
 
 MAX_ROUNDS = 6
-
-
-# ── Clause detection (heuristic, contract-style headings) ──────────────────
-
-_HEADING_PATTERNS = [
-    re.compile(r"^\s*\d+(\.\d+)*[\.\)]\s+\S.{2,100}$"),                               # "1. Definitions" / "2.1) Payment Terms"
-    re.compile(r"^\s*(Section|Article|Clause)\s+\d+[A-Za-z]?\s*[:.\-]?\s*.{0,100}$", re.IGNORECASE),
-    re.compile(r"^\s*[A-Z][A-Z \-/&',]{4,80}\s*$"),                                   # ALL CAPS short heading line
-]
-
-
-def detect_clauses(text: str) -> list[dict]:
-    """Best-effort heading detection — not a real document-structure parser,
-    just regex over likely contract heading shapes. Good enough to give the
-    agent a navigable table of contents; not claimed to be exhaustive."""
-    lines = text.split("\n")
-    clauses: list[dict] = []
-    offset = 0
-    for line in lines:
-        stripped = line.strip()
-        if stripped and len(stripped) < 120:
-            for pat in _HEADING_PATTERNS:
-                if pat.match(stripped):
-                    clauses.append({"heading": stripped, "char_start": offset})
-                    break
-        offset += len(line) + 1  # +1 for the "\n" split boundary
-    for i, c in enumerate(clauses):
-        c["char_end"] = clauses[i + 1]["char_start"] if i + 1 < len(clauses) else len(text)
-    return clauses
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
