@@ -78,7 +78,6 @@ from langgraph.graph import StateGraph, START, END
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, before_sleep_log
 from langsmith import traceable
 
-from app.services.vectorstore import VectorStore
 from app.services.history import get_chat_history
 from app.db.database import get_conn
 from app.services.embeddings import embed_text
@@ -94,9 +93,6 @@ MAX_ITERATIONS = 2          # max retrieve→grade→rewrite loops before forcin
 # round (82.1s). Trading a little self-correction depth for a lower
 # worst-case ceiling: most requests never need more than 1 round anyway.
 RELEVANCE_THRESHOLD = 0.5   # fraction of relevant docs below which we trigger CRAG web search
-
-# ── Singletons ─────────────────────────────────────────────────────────────────
-vectorstore = VectorStore()
 cross_encoder = None
 
 def get_reranker():

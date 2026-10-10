@@ -68,7 +68,6 @@ def _with_hard_timeout(llm, seconds: float, name: str):
     return RunnableLambda(_invoke, name=f"{name}_bounded")
 
 from app.services.chunking import hierarchical_chunk_text
-from app.services.vectorstore import VectorStore
 from app.services.document_service import (
     ingest_document, ensure_session, ensure_user, get_session_document_ids, get_documents_by_ids,
 )
@@ -88,9 +87,6 @@ from app.core.config import (
 )
 
 logger = logging.getLogger("rag")
-
-# ── Singletons ─────────────────────────────────────────────────────────────────
-vectorstore = VectorStore()
 
 
 # ── Internal semantic cache write helper ───────────────────────────────────────
@@ -317,9 +313,18 @@ def process_document(
         home_session_id=session_id,
     )
 
-    if flat_children:
-        vectorstore.add(flat_children, metadata=chunk_metadatas)
-        print(f"  → Added to PGVector/HNSW (document_id={document_id})")
+    # Note: child chunks are NOT also written to the separate LangChain
+    # PGVector `default_collection` here. That write used to happen
+    # unconditionally, but nothing in the live retrieval path ever reads from
+    # it — langgraph_rag.retrieve() queries the hand-rolled hybrid_search()
+    # SQL function directly against document_chunks/embeddings (already
+    # populated by ingest_document() above), not through VectorStore/
+    # retriever.py. The write was pure waste on every upload, and worse: a
+    # transient failure in it (observed live: a Postgres SSL "decryption
+    # failed" blip) propagated up and triggered Celery's retry, which re-ran
+    # this whole function from scratch — duplicating the already-committed
+    # document, chunks, and embeddings rather than just the unrelated write
+    # that actually failed.
 
     # Attach to the session this upload was made in, if any — this is what
     # scopes retrieval (hybrid_search's filter_document_ids) to exactly the

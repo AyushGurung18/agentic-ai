@@ -107,7 +107,11 @@ def ingest_document_task(
         )
 
         # ── Mark as done ───────────────────────────────────────────────────────
-        _update_job(job_id, status="done", progress_percent=100, document_id=document_id)
+        # error explicitly cleared: if a retry attempt follows a failed first
+        # attempt (SoftTimeLimitExceeded or a transient error), the earlier
+        # attempt already wrote `error` — without this, a job that ultimately
+        # succeeds keeps showing a stale failure message forever.
+        _update_job(job_id, status="done", progress_percent=100, document_id=document_id, error=None)
         logger.info("[ingest_document_task] ✅ Done job_id=%s document_id=%s", job_id, document_id)
         return {"job_id": job_id, "document_id": document_id}
 
