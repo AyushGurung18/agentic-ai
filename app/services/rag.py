@@ -239,11 +239,29 @@ def get_llm_by_intent(intent: str):
     # free auto-router hands back a different model per call (observed 5
     # different models in 5 calls), so a second draw is a real extra
     # chance, not a wasted repeat.
+    # 2026-10-10 live-testing pass: with the dead NVIDIA candidate removed
+    # (below) and the new _llm_with_fallbacks() actually surfacing every
+    # provider's real error instead of just the first one, it turned out
+    # EVERY remaining candidate was independently broken too:
+    #   - Groq's "llama-3.3-70b-versatile" / "llama-3.1-8b-instant" were
+    #     retired by Groq on 2026-08-16 (free/dev tier) — 400 model_not_found.
+    #     Replaced with Groq's recommended production replacements,
+    #     openai/gpt-oss-120b and openai/gpt-oss-20b.
+    #   - Gemini's "gemini-2.5-pro" is retired — 404 NOT_FOUND, and the
+    #     error body itself names the replacement: gemini-3.1-pro-preview.
+    #     "gemini-2.5-flash" is in the same boat (shutdown 2026-10-16) —
+    #     switched to the "gemini-flash-latest" alias already used
+    #     successfully by the GEMINI_API_KEY_2 candidate just below it,
+    #     instead of pinning another version number that will go stale.
+    # OpenRouter's two candidates were hitting the free tier's daily quota
+    # (429, resets daily at UTC midnight) and the self-hosted vLLM fallback
+    # was unreachable ("Connection error") — both are capacity/infra
+    # conditions, not code bugs, so left as-is.
     if intent == "cheap":
         temperature = 0.1
         candidates = []
         if GROQ_API_KEY_2:
-            candidates.append(("Groq #2 Llama 3.1 8B", ChatGroq(model_name="llama-3.1-8b-instant", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if OPENROUTER_API_KEY:
@@ -251,9 +269,9 @@ def get_llm_by_intent(intent: str):
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
-            candidates.append(("Groq #1 Llama 3.1 8B", ChatGroq(model_name="llama-3.1-8b-instant", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
     else:
         temperature = 0.2
         candidates = []
@@ -266,17 +284,17 @@ def get_llm_by_intent(intent: str):
         # every candidate fails, it was also masking whatever was actually
         # wrong with every fallback behind it (see _llm_with_fallbacks below).
         if GROQ_API_KEY_2:
-            candidates.append(("Groq #2 Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY_2:
-            candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
-            candidates.append(("Groq #1 Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
     candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
