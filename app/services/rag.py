@@ -176,7 +176,7 @@ def route_intent(question: str) -> str:
         logger.warning(f"Intent router failed: {e}. Defaulting to 'complex'.")
         return "complex"
 
-def _get_vllm_llm(temperature: float) -> ChatOpenAI:
+def _get_vllm_llm(temperature: float, timeout_s: float = PROVIDER_TIMEOUT_S) -> ChatOpenAI:
     """Self-hosted fallback — talks to a vLLM OpenAI-compatible server.
 
     vLLM's PagedAttention KV-cache manager is what makes this a viable
@@ -188,11 +188,11 @@ def _get_vllm_llm(temperature: float) -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=VLLM_API_KEY,
         temperature=temperature,
-        request_timeout=PROVIDER_TIMEOUT_S,
+        request_timeout=timeout_s,
     )
 
 
-def _get_openrouter_llm(temperature: float) -> ChatOpenAI:
+def _get_openrouter_llm(temperature: float, timeout_s: float = PROVIDER_TIMEOUT_S) -> ChatOpenAI:
     """OpenRouter's free auto-router — OpenAI-compatible, so this reuses
     ChatOpenAI exactly like the vLLM fallback, just pointed at OpenRouter's
     endpoint. "openrouter/free" picks whichever free model is actually
@@ -204,12 +204,22 @@ def _get_openrouter_llm(temperature: float) -> ChatOpenAI:
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
         temperature=temperature,
-        request_timeout=PROVIDER_TIMEOUT_S,
+        request_timeout=timeout_s,
     )
 
 
-def get_llm_by_intent(intent: str, exclude_groq: bool = False):
+def get_llm_by_intent(intent: str, exclude_groq: bool = False, timeout_s: float = PROVIDER_TIMEOUT_S):
     """Returns an LLM with automatic cross-provider fallback baked in.
+
+    timeout_s: per-candidate hard cutoff, overriding the PROVIDER_TIMEOUT_S
+    default. Live-tested 2026-10-10: Gemini consistently needed longer than
+    18s to answer agentic-mode questions (reproducible, both Gemini keys,
+    every attempt) — agentic prompts carry the full document text plus
+    tool descriptions, a much larger prompt than standard chat's retrieved-
+    chunk context, and Gemini's response time scales with it. The agentic
+    path passes a higher value here; standard chat keeps the default, which
+    stays calibrated against the edge Worker's proxy timeout budget across
+    the CRAG graph's several nodes (see PROVIDER_TIMEOUT_S's own comment).
 
     exclude_groq: set by the Part C agentic research path (see
     run_agent_research below). Groq's openai/gpt-oss-* models have a
@@ -288,24 +298,24 @@ def get_llm_by_intent(intent: str, exclude_groq: bool = False):
         temperature = 0.1
         candidates = []
         if GROQ_API_KEY_2 and not exclude_groq:
-            candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
+            candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=timeout_s, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
-            candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=timeout_s)))
         if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=timeout_s)))
         if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
+            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature, timeout_s=timeout_s)))
         if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
+            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature, timeout_s=timeout_s)))
         if GROQ_API_KEY and not exclude_groq:
-            candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
+            candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=timeout_s, reasoning_format="hidden")))
     else:
         temperature = 0.2
         candidates = []
         # Nvidia's "meta/llama-3.1-70b-instruct" was dropped here on
         # 2026-10-10 — confirmed permanently dead (HTTP 410 Gone, "reached
         # its end of life on 2026-08-26"), not transient. As the first
-        # candidate it was unconditionally eating PROVIDER_TIMEOUT_S on
+        # candidate it was unconditionally eating a full provider timeout on
         # every single non-cheap request before falling through, and because
         # LangChain's .with_fallbacks() surfaces only the FIRST error when
         # every candidate fails, it was also masking whatever was actually
@@ -323,20 +333,20 @@ def get_llm_by_intent(intent: str, exclude_groq: bool = False):
         # all, which is all this app's hand-rolled TOOL_CALL/FINAL_ANSWER
         # text protocol needs from it anyway.
         if GROQ_API_KEY_2 and not exclude_groq:
-            candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
+            candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=timeout_s, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
-            candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=timeout_s)))
         if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=timeout_s)))
         if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
+            candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature, timeout_s=timeout_s)))
         if OPENROUTER_API_KEY:
-            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
+            candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature, timeout_s=timeout_s)))
         if GROQ_API_KEY and not exclude_groq:
-            candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
+            candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=timeout_s, reasoning_format="hidden")))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
-    candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
+    candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature, timeout_s=timeout_s)))
 
     names = [n for n, _ in candidates]
     logger.info("🤖 Routing [%s] -> %s (fallbacks: %s)", intent.upper(), names[0], ", ".join(names[1:]) or "none")
@@ -344,7 +354,7 @@ def get_llm_by_intent(intent: str, exclude_groq: bool = False):
     # Every candidate gets the hard external timeout regardless of whether
     # it also has a native one set above — ChatNVIDIA has no native timeout
     # parameter at all, so this is the only thing bounding it.
-    bounded = [(name, _with_hard_timeout(llm, PROVIDER_TIMEOUT_S, name)) for name, llm in candidates]
+    bounded = [(name, _with_hard_timeout(llm, timeout_s, name)) for name, llm in candidates]
     return _llm_with_fallbacks(bounded)
 
 
@@ -464,13 +474,18 @@ def ask_question(
     if mode == "agentic" and len(document_ids) != 1:
         logger.info("[RAG] Agentic mode requested but session has %d documents (needs exactly 1) — falling back to standard.", len(document_ids))
 
-    # Route intent to determine which model to use. exclude_groq=agentic:
-    # see get_llm_by_intent()'s docstring — Groq's gpt-oss models have a
-    # confirmed Groq-side bug where they spontaneously attempt a native
-    # tool call against the agentic path's tool-describing prompt, which
-    # standard chat's prompt never triggers.
+    # Route intent to determine which model to use.
+    #   exclude_groq=agentic: see get_llm_by_intent()'s docstring — Groq's
+    #     gpt-oss models have a confirmed Groq-side bug where they
+    #     spontaneously attempt a native tool call against the agentic
+    #     path's tool-describing prompt, which standard chat's prompt
+    #     never triggers.
+    #   timeout_s: agentic prompts carry the full document text + tool
+    #     descriptions (much larger than standard chat's retrieved-chunk
+    #     context) — live-tested 2026-10-10, Gemini reproducibly needed
+    #     longer than the standard-chat 18s budget to respond here.
     intent = route_intent(question)
-    llm = get_llm_by_intent(intent, exclude_groq=agentic)
+    llm = get_llm_by_intent(intent, exclude_groq=agentic, timeout_s=40 if agentic else PROVIDER_TIMEOUT_S)
 
     logger.info("[RAG] mode=%s intent=%s user=%s session=%s docs=%d q=%s", mode, intent, user_id, session_id, len(document_ids), question[:80])
 
