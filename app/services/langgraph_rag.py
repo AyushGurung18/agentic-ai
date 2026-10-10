@@ -517,12 +517,19 @@ def generate(state: GraphState, llm) -> GraphState:
         history_text += f"{role}: {msg.content}\n"
 
     quote_instruction = (
-        "Quoting rule: whenever you state something that the documents directly support, "
+        "Quoting rule: whenever you state something that the documents directly support, you MUST "
         f"wrap the EXACT text of the supporting passage — copied character-for-character from "
-        f"the excerpt above, never paraphrased — like this: {QUOTE_MARK}exact quoted text{QUOTE_MARK}. "
-        "Do not wrap text that is not a verbatim quote. A claim with no backing quote reads as "
-        "your own inference, not something the document says, so back every factual claim about "
-        "document content with at least one such quote."
+        f"the excerpt above, never paraphrased, never in ordinary quotation marks — in this exact "
+        f"sentinel character, with nothing else added: {QUOTE_MARK}exact quoted text{QUOTE_MARK}. "
+        f"This is not optional formatting — a claim without one of these wraps cannot be verified "
+        f"against the source and will be treated as unsupported.\n"
+        f"Example — if an excerpt says: The deposit is refundable within 14 days of cancellation.\n"
+        f"A correctly formatted answer is: The deposit is refundable within 14 days of cancellation "
+        f"({QUOTE_MARK}The deposit is refundable within 14 days of cancellation.{QUOTE_MARK}).\n"
+        f"Do NOT write it as: The deposit is refundable within 14 days of cancellation (\"The deposit "
+        f"is refundable within 14 days of cancellation.\") — ordinary quotation marks are never a "
+        f"substitute for the {QUOTE_MARK} sentinel.\n"
+        "Do not wrap text that is not a verbatim quote."
     )
     if multi_doc:
         quote_instruction += (

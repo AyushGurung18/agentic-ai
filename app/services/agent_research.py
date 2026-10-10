@@ -268,7 +268,11 @@ On every turn, respond with EXACTLY ONE of the following and nothing else:
 
 You have at most {max_rounds} tool calls total ({calls_made} used so far) — use them purposefully. A reasonable approach: list_clauses() or a targeted search_document() for the relevant topic, then get_section() on anything promising. Don't call tools you don't need, and don't repeat an identical call.
 
-Quoting rule: whenever your final answer states something the document directly supports, wrap the EXACT text of the supporting passage — copied character-for-character from a tool result, never paraphrased — like this: {quote_mark}exact quoted text{quote_mark}. Do not wrap text that isn't a verbatim quote.
+Quoting rule: whenever your final answer states something the document directly supports, you MUST wrap the EXACT text of the supporting passage — copied character-for-character from a tool result, never paraphrased, never in ordinary quotation marks — in this exact sentinel character, with nothing else added: {quote_mark}exact quoted text{quote_mark}. This is not optional formatting — a claim without one of these wraps cannot be verified and will be treated as unsupported.
+Example — if a tool result contains: The deposit is refundable within 14 days of cancellation.
+A correctly formatted answer is: The deposit is refundable within 14 days of cancellation ({quote_mark}The deposit is refundable within 14 days of cancellation.{quote_mark}).
+Do NOT write it as: The deposit is refundable within 14 days of cancellation ("The deposit is refundable within 14 days of cancellation.") — ordinary quotation marks are never a substitute for the {quote_mark} sentinel.
+Do not wrap text that isn't a verbatim quote.
 
 Coverage rule: you have only seen what you explicitly looked up via tools, not the whole document. If you didn't look something up, or a search found nothing, say so in your final answer rather than claiming the document does or doesn't contain something you never actually checked.
 
