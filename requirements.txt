@@ -3,6 +3,9 @@ uvicorn
 pymupdf4llm
 requests
 
+# Document parsing (PDF + DOCX)
+python-docx
+
 # Supervisor (multi-process manager for HF Space)
 supervisor
 

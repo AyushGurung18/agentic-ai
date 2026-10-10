@@ -27,6 +27,7 @@ class UploadResponse(BaseModel):
 class CreateSessionRequest(BaseModel):
     user_id: Optional[str] = None
     title: Optional[str] = None
+    document_ids: Optional[list[str]] = None  # attach existing library doc(s) — multi-doc Q&A
 
 class SessionResponse(BaseModel):
     id: str

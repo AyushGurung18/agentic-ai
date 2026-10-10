@@ -28,9 +28,14 @@ import uuid as _uuid
 from typing import Optional
 from pydantic import BaseModel
 
-from app.services.pdf_loader import extract_text
+from app.services.pdf_loader import extract_pdf
+from app.services.docx_loader import extract_docx
 from app.services.rag import ask_question
-from app.services.document_service import ensure_user, ensure_session
+from app.services.document_service import (
+    ensure_user, ensure_session,
+    list_documents, get_document, get_documents_by_ids, delete_document,
+    get_session_document_ids,
+)
 from app.db.database import get_conn
 from app.models.schemas import (
     UploadResponse,
@@ -55,10 +60,12 @@ def health():
 
 # ── Upload (async — dispatches to Celery worker) ─────────────────────────────
 
-from app.services.storage import upload_file_stream_to_r2, delete_file_from_r2
+from app.services.storage import upload_file_stream_to_r2, delete_file_from_r2, download_file_from_r2
 from app.worker.tasks import ingest_document_task
 
 MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024  # 20MB — keep in sync with the frontend's client-side check
+
+ACCEPTED_EXTENSIONS = {".pdf": "pdf", ".docx": "docx"}
 
 
 class UploadJobResponse(BaseModel):
@@ -85,22 +92,31 @@ async def upload(
     user_id: str = Depends(get_current_user_id),
 ):
     """
-    Upload a PDF and queue it for background processing via Celery + RabbitMQ.
+    Upload a PDF or DOCX and queue it for background processing via Celery + RabbitMQ.
 
-    Returns immediately with a job_id.  Large PDFs (100 pages) are chunked
-    and embedded asynchronously — poll GET /upload/status/{job_id} for progress.
+    Returns immediately with a job_id.  Large documents (150+ pages) are
+    chunked and embedded asynchronously — poll GET /upload/status/{job_id}
+    for progress.
 
     In-memory strategy
     ──────────────────
-    The raw PDF bytes are read once into a BytesIO buffer in the API process.
-    That same buffer (seeked back to 0 between uses) is passed to:
-      1. R2 upload  — stores the original PDF for durable retrieval
-      2. extract_text() — parses text with fitz entirely in-memory (no disk I/O)
-    The extracted text string is then handed to Celery, which does chunking +
-    embedding in the worker process — keeping the API process lightweight.
+    The raw file bytes are read once into memory in the API process and used
+    for both the R2 upload and text extraction — no disk I/O.  The extracted
+    text is then handed to Celery, which does chunking + embedding in the
+    worker process, keeping the API process lightweight.
     """
-    if not file.filename or not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    filename = file.filename or ""
+    ext = next((e for e in ACCEPTED_EXTENSIONS if filename.lower().endswith(e)), None)
+    if not ext:
+        accepted = ", ".join(sorted(ACCEPTED_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Only {accepted} files are supported.",
+        )
+    doc_type = ACCEPTED_EXTENSIONS[ext]
+    content_type = "application/pdf" if doc_type == "pdf" else (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
 
     # Ensure the user row exists (idempotent upsert)
     ensure_user(user_id, email=f"anon-{user_id}@thotqen.internal")
@@ -108,8 +124,6 @@ async def upload(
     try:
         import io as _io
         # ── Read the entire upload once into memory ──────────────────────────
-        # This guarantees both R2 upload and text extraction see the full bytes
-        # without any disk writes — critical for HF Space containers.
         # Read one byte past the cap so an oversized file is rejected cleanly
         # instead of being fully buffered into memory first.
         raw_bytes = await file.read(MAX_UPLOAD_SIZE_BYTES + 1)
@@ -118,21 +132,50 @@ async def upload(
                 status_code=413,
                 detail=f"File exceeds the {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB upload limit.",
             )
+        if len(raw_bytes) == 0:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-        # 1. Upload the raw PDF to R2 for storage
+        # 1. Upload the raw file to R2 for storage (viewer + re-download)
         # boto3's upload_fileobj() closes the buffer it's given once the
         # transfer completes — give it its own BytesIO instead of sharing
         # one with text extraction, or the second read fails with
         # "I/O operation on closed file."
         try:
-            r2_url = upload_file_stream_to_r2(_io.BytesIO(raw_bytes), file.filename)
+            r2_url = upload_file_stream_to_r2(_io.BytesIO(raw_bytes), filename, content_type=content_type)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to upload to R2: {str(e)}")
 
-        # 2. Extract text in-process (fast; just PDF parsing, not embedding)
-        text = extract_text(_io.BytesIO(raw_bytes))
-        if not text.strip():
-            raise HTTPException(status_code=422, detail="PDF appears to be empty or unreadable.")
+        # 2. Extract text in-process (fast; just parsing, not embedding)
+        try:
+            if doc_type == "pdf":
+                extracted = extract_pdf(_io.BytesIO(raw_bytes))
+            else:
+                extracted = extract_docx(_io.BytesIO(raw_bytes))
+        except Exception as e:
+            delete_file_from_r2(r2_url)
+            raise HTTPException(
+                status_code=422,
+                detail=f"Could not parse this {doc_type.upper()} file — it may be corrupted. ({e})",
+            )
+
+        if not extracted.text.strip():
+            delete_file_from_r2(r2_url)
+            # A PDF with zero extractable text is almost always a scanned
+            # image with no OCR layer — tell the user plainly rather than
+            # silently saving an empty document and calling it a success.
+            hint = (
+                "This looks like a scanned PDF with no extractable text (no OCR layer). "
+                "Upload a text-based PDF, or an OCR'd version of this one."
+                if doc_type == "pdf" else
+                "This DOCX file has no readable text content."
+            )
+            raise HTTPException(status_code=422, detail=hint)
+
+        # Pages cross a Celery/JSON boundary — plain dicts, not dataclasses.
+        pages_payload = [
+            {"page_number": p.page_number, "char_start": p.char_start, "char_end": p.char_end}
+            for p in extracted.pages
+        ]
 
         # 3. Create a document_jobs row (status=pending)
         job_id = str(_uuid.uuid4())
@@ -144,7 +187,7 @@ async def upload(
                         INSERT INTO document_jobs (id, user_id, filename, r2_url, status)
                         VALUES (%s::uuid, %s::uuid, %s, %s, 'pending')
                         """,
-                        (job_id, user_id, file.filename, r2_url),
+                        (job_id, user_id, filename, r2_url),
                     )
                 conn.commit()
         except Exception:
@@ -156,16 +199,19 @@ async def upload(
         # 4. Dispatch Celery task — returns immediately
         ingest_document_task.delay(
             job_id=job_id,
-            text=text,
-            filename=file.filename,
+            text=extracted.text,
+            filename=filename,
             user_id=user_id,
             session_id=session_id,
             metadata_tags={"r2_url": r2_url},
+            doc_type=doc_type,
+            pages=pages_payload,
+            r2_url=r2_url,
         )
 
         return UploadJobResponse(
             job_id=job_id,
-            filename=file.filename,
+            filename=filename,
         )
 
     except HTTPException:
@@ -304,6 +350,11 @@ def ask(
 class ChatRequest(BaseModel):
     q: str
     session_id: str = "00000000-0000-0000-0000-000000000000"
+    # "agentic" = Part C tool-calling research mode (search_document /
+    # get_section / list_clauses). Only applies when the session has exactly
+    # one attached document — ask_question() falls back to "standard"
+    # otherwise rather than erroring.
+    mode: str = "standard"
 
 
 @router.post("/chat")
@@ -317,7 +368,7 @@ def chat(
 
     ensure_user(user_id, email=f"anon-{user_id}@thotqen.internal")
     response_stream = ask_question(
-        body.q, body.session_id, user_id=user_id
+        body.q, body.session_id, user_id=user_id, mode=body.mode,
     )
     return StreamingResponse(response_stream, media_type="text/plain")
 
@@ -335,6 +386,15 @@ def create_session(
     new_id = str(_uuid.uuid4())
     title = body.title or "New Chat"
     ensure_session(new_id, user_id, title=title)
+
+    if body.document_ids:
+        # Ownership-checked via get_documents_by_ids — an id the caller
+        # doesn't own is silently dropped rather than attached.
+        owned = get_documents_by_ids(body.document_ids, user_id)
+        for doc_id in body.document_ids:
+            if doc_id in owned:
+                from app.services.document_service import attach_document_to_session
+                attach_document_to_session(new_id, doc_id)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -510,6 +570,54 @@ def rename_session(
     return {"id": session_id, "title": title}
 
 
+# Defined here (ahead of the rest of the document-library section further
+# below) because get_session_documents, right after this, needs them at
+# decoration time.
+class DocumentResponse(BaseModel):
+    id: str
+    filename: str
+    doc_type: str
+    status: str
+    page_count: Optional[int] = None
+    char_count: Optional[int] = None
+    created_at: str
+    home_session_id: Optional[str] = None
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentResponse]
+
+
+@router.get("/sessions/{session_id}/documents", response_model=DocumentListResponse)
+def get_session_documents(
+    session_id: str,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Which document(s) a session is grounded in — drives the chat page's
+    viewer launches, the agentic-mode toggle (single doc only), and the
+    "N documents" badge for a multi-document session."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM sessions WHERE id = %s::uuid", (session_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Session not found.")
+            if str(row[0]) != user_id:
+                raise HTTPException(status_code=403, detail="Not your session.")
+
+    doc_ids = get_session_document_ids(session_id)
+    docs = get_documents_by_ids(doc_ids, user_id)
+    return DocumentListResponse(documents=[
+        DocumentResponse(
+            id=doc_id, filename=d["filename"], doc_type=d["doc_type"] or "pdf",
+            status=d.get("status") or "ready", page_count=len(d["pages"]) if d.get("doc_type") == "pdf" else None,
+            char_count=len(d["content"]),
+            created_at=d["created_at"].isoformat() if hasattr(d.get("created_at"), "isoformat") else str(d.get("created_at") or ""),
+        )
+        for doc_id, d in docs.items()
+    ])
+
+
 @router.get("/sessions/{session_id}/messages", response_model=MessageListResponse)
 def get_session_messages(
     session_id: str,
@@ -606,3 +714,107 @@ def get_session_messages(
         for m in msgs_db
     ]
     return MessageListResponse(messages=msgs)
+
+
+# ── Document library ──────────────────────────────────────────────────────────
+# Documents are first-class, independent of any one chat session: a session
+# just records *which* document(s) it's grounded in (session_documents).
+# This is what lets the library list/open/delete uploaded files on its own,
+# and what lets multiple documents be selected for one cross-document question.
+# (DocumentResponse / DocumentListResponse are defined earlier, above
+# get_session_documents, which needs them sooner.)
+
+@router.get("/documents", response_model=DocumentListResponse)
+def get_documents(user_id: str = Depends(get_current_user_id)):
+    docs = list_documents(user_id)
+    return DocumentListResponse(documents=[
+        DocumentResponse(
+            id=d["id"], filename=d["filename"], doc_type=d["doc_type"] or "pdf",
+            status=d["status"] or "ready", page_count=d["page_count"], char_count=d["char_count"],
+            created_at=d["created_at"].isoformat() if hasattr(d["created_at"], "isoformat") else str(d["created_at"]),
+            home_session_id=d.get("home_session_id"),
+        )
+        for d in docs
+    ])
+
+
+@router.delete("/documents/{document_id}", response_model=DeleteResponse)
+def remove_document(document_id: str, user_id: str = Depends(get_current_user_id)):
+    """Delete a document from the library. Cascades to its chunks,
+    embeddings, page map, and session links — chat sessions that referenced
+    it remain (their message history is independent), they just lose the
+    ability to retrieve from a now-deleted document."""
+    ok = delete_document(document_id, user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return DeleteResponse(deleted=True, id=document_id)
+
+
+@router.get("/documents/{document_id}/file")
+def get_document_file(document_id: str, user_id: str = Depends(get_current_user_id)):
+    """Streams the original PDF/DOCX bytes back — used by the in-browser
+    viewer (react-pdf / mammoth) for citation highlighting. Proxied through
+    this authenticated endpoint rather than a public bucket URL so ownership
+    is enforced the same way as every other route."""
+    doc = get_document(document_id, user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    if not doc.get("r2_url"):
+        raise HTTPException(status_code=404, detail="Original file is not available for this document.")
+
+    try:
+        raw_bytes = download_file_from_r2(doc["r2_url"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch the original file: {e}")
+
+    media_type = (
+        "application/pdf" if doc["doc_type"] == "pdf"
+        else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    from fastapi.responses import Response as _Response
+    return _Response(content=raw_bytes, media_type=media_type)
+
+
+@router.get("/documents/{document_id}/text")
+def get_document_text(document_id: str, user_id: str = Depends(get_current_user_id)):
+    """Extracted text + page offset map — used by the DOCX viewer (which
+    renders from server-converted HTML, not the raw bytes) and by the
+    frontend's own quote-locating fallback."""
+    doc = get_document(document_id, user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {
+        "id": doc["id"],
+        "filename": doc["filename"],
+        "doc_type": doc["doc_type"],
+        "content": doc["content"],
+        "pages": doc["pages"],
+    }
+
+
+# ── Document comparison (Part B #7) ─────────────────────────────────────────
+
+class CompareRequest(BaseModel):
+    document_id_a: str
+    document_id_b: str
+
+
+@router.post("/documents/compare")
+def compare_documents_route(
+    body: CompareRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    doc_a = get_document(body.document_id_a, user_id)
+    doc_b = get_document(body.document_id_b, user_id)
+    if not doc_a or not doc_b:
+        raise HTTPException(status_code=404, detail="One or both documents were not found.")
+
+    from app.services.document_compare import compare_documents
+    from app.services.rag import get_llm_by_intent
+
+    llm = get_llm_by_intent("complex")
+    try:
+        result = compare_documents(doc_a["content"], doc_a["filename"], doc_b["content"], doc_b["filename"], llm)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {e}")
+    return result

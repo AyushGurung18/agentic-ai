@@ -69,11 +69,16 @@ def _with_hard_timeout(llm, seconds: float, name: str):
 
 from app.services.chunking import hierarchical_chunk_text
 from app.services.vectorstore import VectorStore
-from app.services.document_service import ingest_document, ensure_session, ensure_user
+from app.services.document_service import (
+    ingest_document, ensure_session, ensure_user, get_session_document_ids, get_documents_by_ids,
+)
 from app.services.hf_cache import append_messages_to_cache
 from app.services.history import save_message
-from app.services.langgraph_rag import run_rag_graph, invoke_with_retry
+from app.services.langgraph_rag import run_rag_graph, invoke_with_retry, group_documents_by_source
+from app.services.quote_annotator import annotate_quotes, DocRef
+from app.services.agent_research import run_agent_research
 from app.services.embeddings import embed_text
+import json as _json
 from app.core.config import (
     CHUNK_SIZE, CHUNK_OVERLAP,
     VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY,
@@ -269,6 +274,9 @@ def process_document(
     session_id: str | None = None,
     metadata_tags: dict[str, str] | None = None,
     progress_callback = None,
+    doc_type: str = "pdf",
+    pages: list | None = None,
+    r2_url: str | None = None,
 ) -> str:
     """
     Chunk text → persist to DB (documents / chunks / embeddings) → add to PGVector.
@@ -303,10 +311,23 @@ def process_document(
         user_id=user_id,
         metadata_tags=tags,
         progress_callback=progress_callback,
+        doc_type=doc_type,
+        pages=pages,
+        r2_url=r2_url,
+        home_session_id=session_id,
     )
 
-    vectorstore.add(flat_children, metadata=chunk_metadatas)
-    print(f"  → Added to PGVector/HNSW (document_id={document_id})")
+    if flat_children:
+        vectorstore.add(flat_children, metadata=chunk_metadatas)
+        print(f"  → Added to PGVector/HNSW (document_id={document_id})")
+
+    # Attach to the session this upload was made in, if any — this is what
+    # scopes retrieval (hybrid_search's filter_document_ids) to exactly the
+    # document(s) the user is actually chatting with, instead of pooling
+    # across every document they've ever uploaded.
+    if session_id:
+        from app.services.document_service import attach_document_to_session
+        attach_document_to_session(session_id, document_id)
 
     return document_id
 
@@ -317,17 +338,18 @@ def ask_question(
     question: str,
     session_id: str = "00000000-0000-0000-0000-000000000000",
     user_id: str | None = None,
+    mode: str = "standard",
 ):
     """
-    Stream answer tokens via the LangGraph CRAG graph.
+    Stream answer tokens via either:
+      • the standard LangGraph CRAG graph (retrieve → grade → [rewrite/web] → generate), or
+      • the Part C agentic research loop (mode="agentic") — a bounded
+        multi-round tool-calling loop over a single document (search_document /
+        get_section / list_clauses), shown live as it runs.
 
-    Graph flow:
-      retrieve → grade_documents → [rewrite / web_search] → generate
-
-    After the graph completes, writes the Q&A pair to:
-      • Semantic cache (Cloudflare KV via internal endpoint)
-      • HF disk cache (local session JSON)
-    Both writes are non-blocking background threads.
+    Both paths converge on the same quote-verification step before anything
+    is persisted or streamed, and write the Q&A pair to the semantic cache +
+    HF disk cache in background threads afterward.
     """
     if user_id is None:
         user_id = DEV_USER_ID
@@ -349,29 +371,68 @@ def ask_question(
     intent = route_intent(question)
     llm = get_llm_by_intent(intent)
 
-    logger.info("[RAG] intent=%s user=%s session=%s q=%s", intent, user_id, session_id, question[:80])
+    document_ids = get_session_document_ids(session_id)
+
+    logger.info("[RAG] mode=%s intent=%s user=%s session=%s docs=%d q=%s", mode, intent, user_id, session_id, len(document_ids), question[:80])
+
+    agentic = mode == "agentic" and len(document_ids) == 1
+    if mode == "agentic" and len(document_ids) != 1:
+        logger.info("[RAG] Agentic mode requested but session has %d documents (needs exactly 1) — falling back to standard.", len(document_ids))
+
+    full_answer = ""
+    doc_refs: dict[int, DocRef] = {}
 
     try:
-        # run_rag_graph is now a generator: it yields {"type": "status", ...}
-        # after every graph node completes (real progress, not a blind
-        # spinner) and finally {"type": "done", "answer": ...}. Status
-        # events are wrapped in \x1e (ASCII Record Separator) markers so
-        # the frontend can pull them out of the token stream and show them
-        # as a live status line instead of appending them to the visible
-        # answer — \x1e never occurs in normal generated text, so it's a
-        # safe, unambiguous delimiter without needing a bigger protocol
-        # change (SSE event types, etc.) on either side.
-        full_answer = ""
-        for event in run_rag_graph(
-            question=question,
-            session_id=session_id,
-            user_id=user_id,
-            llm=llm,
-        ):
-            if event["type"] == "status":
-                yield f"\x1e{event['label']}\x1e"
-            elif event["type"] == "done":
-                full_answer = event["answer"]
+        if agentic:
+            fetched = get_documents_by_ids(document_ids, user_id)
+            doc_data = fetched.get(document_ids[0])
+            if doc_data is None:
+                raise RuntimeError("Document not found or no longer accessible.")
+            doc_ref = DocRef(
+                document_id=document_ids[0], filename=doc_data["filename"],
+                text=doc_data["content"], pages=doc_data["pages"],
+            )
+            doc_refs = {1: doc_ref}
+            for event in run_agent_research(question=question, doc=doc_ref, llm=llm):
+                if event["type"] == "status":
+                    yield f"\x1e{event['label']}\x1e"
+                elif event["type"] == "done":
+                    full_answer = event["answer"]
+        else:
+            # run_rag_graph is now a generator: it yields {"type": "status", ...}
+            # after every graph node completes (real progress, not a blind
+            # spinner) and finally {"type": "done", "answer": ..., "documents": [...]}.
+            # Status events are wrapped in \x1e (ASCII Record Separator) markers so
+            # the frontend can pull them out of the token stream and show them
+            # as a live status line instead of appending them to the visible
+            # answer — \x1e never occurs in normal generated text, so it's a
+            # safe, unambiguous delimiter without needing a bigger protocol
+            # change (SSE event types, etc.) on either side.
+            retrieved_docs = []
+            for event in run_rag_graph(
+                question=question,
+                session_id=session_id,
+                user_id=user_id,
+                llm=llm,
+                document_ids=document_ids,
+            ):
+                if event["type"] == "status":
+                    yield f"\x1e{event['label']}\x1e"
+                elif event["type"] == "done":
+                    full_answer = event["answer"]
+                    retrieved_docs = event.get("documents", [])
+
+            doc_order, doc_filenames = group_documents_by_source(retrieved_docs)
+            if doc_order:
+                fetched = get_documents_by_ids(doc_order, user_id)
+                doc_refs = {
+                    i + 1: DocRef(
+                        document_id=doc_id, filename=doc_filenames.get(doc_id, "document"),
+                        text=fetched[doc_id]["content"], pages=fetched[doc_id]["pages"],
+                    )
+                    for i, doc_id in enumerate(doc_order)
+                    if doc_id in fetched
+                }
     except Exception as e:
         error_answer = f"Error generating answer: {str(e)}"
         try:
@@ -384,9 +445,24 @@ def ask_question(
     if not full_answer.strip():
         full_answer = "I was unable to find relevant information to answer your question."
 
-    # Persist the assistant's answer as soon as it's ready — before the
-    # perceived-streaming yield loop below — so a reload reflects the real
-    # exchange even if the client disconnects mid-stream.
+    # ── Verify every quote before anything is shown to the user ────────────────
+    # This is the core "verified quotes" requirement: re-locate each quote
+    # the model produced in the actual document text ourselves (never trust
+    # the model's own claim about where it came from), and rewrite the
+    # answer so the frontend can render verified quotes as clickable/
+    # highlighted and unverified ones as clearly flagged — never silently
+    # as if they were genuine.
+    quote_meta: list[dict] = []
+    try:
+        full_answer, quote_meta = annotate_quotes(full_answer, doc_refs)
+    except Exception as exc:
+        logger.warning("[quotes] Verification failed, stripping quote markers: %s", exc)
+        full_answer, quote_meta = annotate_quotes(full_answer, {})
+
+    # Persist the assistant's answer (with quote markers resolved to
+    # verbatim/verified text) as soon as it's ready — before the perceived-
+    # streaming yield loop below — so a reload reflects the real exchange
+    # even if the client disconnects mid-stream.
     try:
         save_message(session_id, "assistant", full_answer)
     except Exception as exc:
@@ -397,6 +473,14 @@ def ask_question(
     STREAM_CHUNK = 20
     for i in range(0, len(full_answer), STREAM_CHUNK):
         yield full_answer[i:i + STREAM_CHUNK]
+
+    # Quote verification metadata, one entry per QUOTE_MARK pair in the
+    # stream above, in order. Sent as a single marker (reusing the \x1e
+    # status-line channel with a reserved prefix) after all the answer text,
+    # since the frontend needs the whole answer in hand to walk quote marks
+    # in order and attach metadata by index.
+    if quote_meta:
+        yield f"\x1e__QUOTES__:{_json.dumps(quote_meta)}\x1e"
 
     # ── Write to semantic cache in background thread ───────────────────────────
     if full_answer.strip():

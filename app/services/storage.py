@@ -52,6 +52,19 @@ def upload_file_stream_to_r2(file_obj, filename: str, content_type: str = "appli
     return public_url
 
 
+def download_file_from_r2(r2_url: str) -> bytes:
+    """Fetch the raw bytes of a previously uploaded file — used to serve the
+    original PDF/DOCX back to the document viewer. We proxy through our own
+    authenticated endpoint rather than relying on a public bucket URL, so
+    per-user ownership checks still apply.
+    """
+    bucket_name = os.getenv("R2_BUCKET_NAME", "user-documents-prod")
+    object_key = r2_url.split(f"/{bucket_name}/", 1)[-1]
+    client = get_r2_client()
+    obj = client.get_object(Bucket=bucket_name, Key=object_key)
+    return obj["Body"].read()
+
+
 def delete_file_from_r2(r2_url: str) -> None:
     """Best-effort cleanup of an R2 object given its public URL.
 

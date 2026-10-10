@@ -65,6 +65,9 @@ def ingest_document_task(
     user_id: str,
     session_id: str | None = None,
     metadata_tags: dict | None = None,
+    doc_type: str = "pdf",
+    pages: list | None = None,
+    r2_url: str | None = None,
 ) -> dict:
     """
     Background task: chunk + embed a document and store in PGVector.
@@ -98,6 +101,9 @@ def ingest_document_task(
             session_id=session_id,
             metadata_tags=metadata_tags or {},
             progress_callback=on_progress,
+            doc_type=doc_type,
+            pages=pages,
+            r2_url=r2_url,
         )
 
         # ── Mark as done ───────────────────────────────────────────────────────

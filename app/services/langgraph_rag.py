@@ -157,6 +157,7 @@ class GraphState(TypedDict, total=False):
     chat_history:        list[BaseMessage]         # injected from session history
     session_id:          str
     user_id:             str
+    document_ids:        list[str]                 # scopes retrieval to this session's attached doc(s)
     iterations:          int                       # loop guard
     web_searched:        bool                      # prevent duplicate web search
     _trigger_web_search: bool                      # internal routing flag set by grade_documents
@@ -242,38 +243,47 @@ def retrieve(state: GraphState) -> GraphState:
         search_text += "\n" + state["hypothetical_answer"]
         
     query_embedding = embed_text([search_text])[0]
-    
+
+    # Scope to exactly the document(s) this session is grounded in. Without
+    # this, retrieval (and later quote verification) could pull chunks from
+    # a completely unrelated document the same user uploaded in a different
+    # chat — see session_documents. A session with zero attached documents
+    # scopes to an empty array (matches nothing) rather than falling back to
+    # "search every document this user has ever uploaded".
+    document_ids = state.get("document_ids", [])
+
     docs = []
     with get_conn() as conn:
         with conn.cursor() as cur:
             # Call our custom RRF hybrid_search function
             cur.execute(
                 """
-                SELECT document_id, parent_chunk_id, content, score
+                SELECT document_id, parent_chunk_id, content, filename, score
                 FROM hybrid_search(
                     query_text := %s,
                     query_embedding := %s::vector,
                     match_count := 10,
                     filter_user_id := %s::uuid,
+                    filter_document_ids := %s::uuid[],
                     rrf_k := 60
                 )
                 """,
-                (query_text, str(query_embedding), state["user_id"])
+                (query_text, str(query_embedding), state["user_id"], document_ids)
             )
-            
+
             for row in cur.fetchall():
-                doc_id, parent_id, content, score = row
-                
+                doc_id, parent_id, content, filename, score = row
+
                 # If this child chunk has a parent, fetch the parent's content for better context
                 if parent_id:
                     cur.execute("SELECT content FROM document_chunks WHERE id = %s::uuid", (parent_id,))
                     parent_row = cur.fetchone()
                     if parent_row:
                         content = parent_row[0]
-                
+
                 docs.append(Document(
                     page_content=content,
-                    metadata={"document_id": str(doc_id), "score": float(score)}
+                    metadata={"document_id": str(doc_id), "filename": filename, "score": float(score)}
                 ))
                 
     logger.info("[retrieve] Got %d docs from hybrid search", len(docs))
@@ -431,13 +441,78 @@ def web_search(state: GraphState) -> GraphState:
         return state
 
 
+def group_documents_by_source(docs: list[Document]) -> tuple[list[str], dict[str, str]]:
+    """First-seen-order (document_id, filename) grouping shared by generate()
+    (to build the numbered [Document N: ...] context + quoting instructions)
+    and rag.py's post-generation quote verification (to assign the SAME
+    numbering when resolving "N:" prefixes back to a document). Keeping this
+    in one place is what guarantees the two stay in sync.
+
+    Only real, uploaded documents are included — CRAG's web_search fallback
+    (see web_search() below) tags its results with metadata={"source": url}
+    and no document_id, since they're not from any document the user
+    uploaded. Those are deliberately excluded here: get_documents_by_ids()
+    downstream casts every id in this list to ::uuid, and a web search URL
+    isn't one — including it would crash quote verification (and the whole
+    request) any time the web-search fallback actually fires.
+    """
+    doc_order: list[str] = []
+    doc_filenames: dict[str, str] = {}
+    for d in docs:
+        doc_id = d.metadata.get("document_id")
+        if not doc_id:
+            continue
+        if doc_id not in doc_filenames:
+            doc_order.append(doc_id)
+            doc_filenames[doc_id] = d.metadata.get("filename") or "document"
+    return doc_order, doc_filenames
+
+
+# QUOTE_MARK / DOC_INDEX_MARK: see app/services/quote_annotator.py for the
+# full protocol (shared single source of truth, so the prompt instructions
+# built below and the parser that consumes their output can never drift).
+from app.services.quote_annotator import QUOTE_MARK, DOC_INDEX_MARK
+
+
 @traceable(name="generate_answer", run_type="chain")
 def generate(state: GraphState, llm) -> GraphState:
-    """Generate an answer using relevant docs + chat history."""
-    context = "\n\n---\n\n".join(
-        f"[Source: {d.metadata.get('filename', d.metadata.get('source', 'unknown'))}]\n{d.page_content}"
-        for d in state["documents"]
-    ) if state["documents"] else "No relevant documents found."
+    """Generate an answer using relevant docs + chat history.
+
+    Groups retrieved chunks by their source document and numbers them, so
+    the model can (a) cite verbatim quotes wrapped in QUOTE_MARK for the
+    verification pipeline downstream, and (b) tag which document a quote in
+    a multi-document question came from. See quote_annotator.py for the
+    verification step this prompt's output feeds into.
+    """
+    docs = state.get("documents", [])
+
+    # Group chunks by document_id, preserving first-seen order, and assign
+    # each a stable 1-based index for the model to cite against. Shared with
+    # rag.py's post-generation verification step so "Document N" means the
+    # same thing on both sides. Chunks with no document_id (CRAG's
+    # web_search fallback — see web_search() below) aren't from any
+    # uploaded document, so they're kept out of the numbered citation
+    # scheme entirely; they're still shown to the model as general
+    # unattributed context, just not quotable/verifiable against a document.
+    doc_order, doc_filenames = group_documents_by_source(docs)
+    chunks_by_doc: dict[str, list[str]] = {doc_id: [] for doc_id in doc_order}
+    web_chunks: list[str] = []
+    for d in docs:
+        doc_id = d.metadata.get("document_id")
+        if doc_id and doc_id in chunks_by_doc:
+            chunks_by_doc[doc_id].append(d.page_content)
+        else:
+            web_chunks.append(d.page_content)
+
+    multi_doc = len(doc_order) > 1
+
+    context_parts = [
+        f"[Document {i + 1}: {doc_filenames[doc_id]}]\n" + "\n---\n".join(chunks_by_doc[doc_id])
+        for i, doc_id in enumerate(doc_order)
+    ]
+    if web_chunks:
+        context_parts.append("[Other context — not from an uploaded document, do not quote from this]\n" + "\n---\n".join(web_chunks))
+    context = "\n\n".join(context_parts) if context_parts else "No relevant excerpts were retrieved for this question."
 
     # Format chat history for the prompt
     history_text = ""
@@ -445,12 +520,39 @@ def generate(state: GraphState, llm) -> GraphState:
         role = "Human" if isinstance(msg, HumanMessage) else "Assistant"
         history_text += f"{role}: {msg.content}\n"
 
+    quote_instruction = (
+        "Quoting rule: whenever you state something that the documents directly support, "
+        f"wrap the EXACT text of the supporting passage — copied character-for-character from "
+        f"the excerpt above, never paraphrased — like this: {QUOTE_MARK}exact quoted text{QUOTE_MARK}. "
+        "Do not wrap text that is not a verbatim quote. A claim with no backing quote reads as "
+        "your own inference, not something the document says, so back every factual claim about "
+        "document content with at least one such quote."
+    )
+    if multi_doc:
+        quote_instruction += (
+            f" Since multiple documents are in context, precede each quote with its document number "
+            f"between {DOC_INDEX_MARK} characters, placed immediately before the quote with nothing "
+            f"in between — exactly: {DOC_INDEX_MARK}2{DOC_INDEX_MARK}{QUOTE_MARK}the exact quoted "
+            f"text{QUOTE_MARK} for a quote from Document 2. Compare across documents in your answer "
+            f"rather than answering each separately, and make clear which document each point comes from."
+        )
+
+    coverage_instruction = (
+        "Coverage rule: the excerpts above are the most relevant passages retrieved for this "
+        "question, not necessarily the entire document — a large document cannot fit in one "
+        "request. If you don't see something in these excerpts, say you didn't find it in the "
+        "retrieved excerpts and that it may be elsewhere in the document. Never flatly state a "
+        "document 'does not contain' or 'has no' a clause/term just because it's absent from what "
+        "was retrieved — that is a confident claim you cannot actually support."
+    )
+
     generate_prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a concise, accurate assistant. Use ONLY the provided context to answer.\n"
-         "If the context doesn't contain the answer, clearly say you don't know.\n"
-         "Do not hallucinate facts not in the context.\n\n"
-         "Context:\n{context}"),
+         "You are a precise document-analysis assistant. Use ONLY the provided excerpts to answer — "
+         "do not use outside/general knowledge about the subject matter. If the excerpts don't "
+         "contain the answer, clearly say so instead of guessing.\n\n"
+         f"{quote_instruction}\n\n{coverage_instruction}\n\n"
+         "Excerpts:\n{context}"),
         ("human",
          "{history}Question: {question}"),
     ])
@@ -460,7 +562,7 @@ def generate(state: GraphState, llm) -> GraphState:
         "history": history_text,
         "question": state["question"],
     })
-    logger.info("[generate] Generated answer (%d chars)", len(answer))
+    logger.info("[generate] Generated answer (%d chars, %d source docs)", len(answer), len(doc_order))
     return {**state, "generation": answer}
 
 
@@ -596,6 +698,7 @@ def run_rag_graph(
     session_id: str,
     user_id: str,
     llm,
+    document_ids: list[str] | None = None,
 ):
     """
     Run the Self-RAG + CRAG graph, yielding real progress as it goes.
@@ -620,6 +723,7 @@ def run_rag_graph(
         "chat_history": chat_history,
         "session_id":   session_id,
         "user_id":      user_id,
+        "document_ids": document_ids or [],
         "iterations":   0,
         "web_searched": False,
     }
@@ -653,6 +757,10 @@ def run_rag_graph(
         len(final_state.get("documents", [])), final_state.get("web_searched", False),
         len(final_state.get("generation", "")),
     )
-    yield {"type": "done", "answer": final_state.get("generation", "")}
+    yield {
+        "type": "done",
+        "answer": final_state.get("generation", ""),
+        "documents": final_state.get("documents", []),
+    }
 
     return final_state.get("generation", "I was unable to generate an answer.")
