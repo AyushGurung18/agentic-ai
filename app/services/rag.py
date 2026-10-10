@@ -257,6 +257,18 @@ def get_llm_by_intent(intent: str):
     # (429, resets daily at UTC midnight) and the self-hosted vLLM fallback
     # was unreachable ("Connection error") — both are capacity/infra
     # conditions, not code bugs, so left as-is.
+    # Ordering within each branch: both Groq #2 and Gemini #2/#1 are
+    # confirmed working live (2026-10-10, after the dead-model-id fix
+    # above) and cost nothing per call, so they're tried first. OpenRouter
+    # is demoted below them — not broken, just capacity-capped (free tier:
+    # 50 req/day shared across both OpenRouter slots, confirmed exhausted
+    # mid-day in testing; resets daily at UTC midnight). Groq #1 is demoted
+    # to second-to-last (right before the self-hosted catch-all) because
+    # it's CONFIRMED broken, not transient — "Organization has been
+    # restricted" is an account-level block from Groq that only clears via
+    # a support ticket, so trying it earlier just burns a full
+    # PROVIDER_TIMEOUT_S for a guaranteed failure on every request that
+    # falls through this far.
     if intent == "cheap":
         temperature = 0.1
         candidates = []
@@ -264,14 +276,14 @@ def get_llm_by_intent(intent: str):
             candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if GEMINI_API_KEY:
+            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
             candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
-        if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
     else:
         temperature = 0.2
         candidates = []
@@ -287,14 +299,14 @@ def get_llm_by_intent(intent: str):
             candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
+        if GEMINI_API_KEY:
+            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
             candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
-        if GEMINI_API_KEY:
-            candidates.append(("Gemini #1 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
     candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
