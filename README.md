@@ -1,3 +1,11 @@
+---
+title: Thotqen Backend
+emoji: 🚀
+colorFrom: blue
+colorTo: green
+sdk: docker
+---
+
 # Contract Copilot — Legal Document Analysis
 
 A web app for analysing legal contracts. Upload a PDF or DOCX contract, ask questions about it in a chat, and get answers backed by **quotes that are verified against the actual document text before they're ever shown to you** — not just asserted by the model.
