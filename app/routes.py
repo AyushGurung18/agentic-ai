@@ -373,6 +373,89 @@ def chat(
     return StreamingResponse(response_stream, media_type="text/plain")
 
 
+class TruncateLastAnswerRequest(BaseModel):
+    content: str  # exactly what the client had rendered at the moment "stop" was clicked
+
+
+@router.post("/sessions/{session_id}/truncate-last-answer")
+def truncate_last_answer(
+    session_id: str,
+    body: TruncateLastAnswerRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Called when the user clicks "stop" mid-answer.
+
+    ask_question() generates, quote-verifies, and saves the FULL answer to
+    the DB before it ever starts streaming to the client (verification
+    needs the complete text) — so without this endpoint, a stopped answer
+    looks truncated live but shows the full, un-stopped version again on
+    reopen. The spec's "whatever was generated is kept" only held in the
+    moment, not across a reopen, without this.
+
+    Trims to the last *complete* QUOTE_MARK pair (an odd count means the
+    stop landed mid-quote — the trailing partial quote is dropped rather
+    than left dangling/unclosed) and keeps only the quote-metadata entries
+    that still fall within the truncated text, since quote_meta[i]
+    describes the i-th QUOTE_MARK pair in order (see annotate_quotes()).
+    """
+    from app.services.quote_annotator import QUOTE_MARK
+
+    content = body.content
+    mark_positions = [i for i, ch in enumerate(content) if ch == QUOTE_MARK]
+    if len(mark_positions) % 2 == 1:
+        content = content[:mark_positions[-1]]
+        mark_positions = mark_positions[:-1]
+    kept_quote_count = len(mark_positions) // 2
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM sessions WHERE id = %s::uuid",
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Session not found.")
+            if str(row[0]) != user_id:
+                raise HTTPException(status_code=403, detail="Not your session.")
+
+            cur.execute(
+                """
+                SELECT id, metadata FROM messages
+                WHERE session_id = %s::uuid AND role = 'assistant'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            msg_row = cur.fetchone()
+            if not msg_row:
+                return {"status": "no_message_to_truncate"}
+
+            msg_id, raw_meta = msg_row
+            if isinstance(raw_meta, dict):
+                meta = raw_meta
+            elif raw_meta:
+                try:
+                    meta = json.loads(raw_meta)
+                except (TypeError, ValueError):
+                    meta = {}
+            else:
+                meta = {}
+            quotes = meta.get("quotes") or []
+            new_meta = {**meta, "quotes": quotes[:kept_quote_count]} if quotes else (meta or None)
+
+            cur.execute(
+                "UPDATE messages SET content = %s, metadata = %s::jsonb WHERE id = %s::uuid",
+                (content, json.dumps(new_meta) if new_meta else None, msg_id),
+            )
+        conn.commit()
+
+    hf_cache.invalidate_session_cache(user_id, session_id)
+    return {"status": "truncated"}
+
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 
 @router.post("/sessions", response_model=SessionResponse)

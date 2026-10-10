@@ -325,6 +325,24 @@ def update_index(
         logger.warning("[HFCache] Index update failed user=%s: %s", user_id[:8], exc)
 
 
+def invalidate_session_cache(user_id: str, session_id: str) -> None:
+    """
+    Remove just a session's cached JSON file (not its index.json entry) so
+    the next read falls through to Supabase and repopulates fresh. Unlike
+    delete_from_cache(), this leaves the session in the user's "recent
+    sessions" list — for when the session itself still exists and is still
+    valid, but its cached message content just went stale (e.g. a message
+    was edited/truncated directly in the DB after the cache was written).
+    """
+    for is_anon in (False, True):
+        p = get_session_path(user_id, session_id, is_anon)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("[HFCache] Invalidate failed session=%s: %s", session_id[:8], exc)
+    logger.info("[HFCache] INVALIDATE session=%s", session_id[:8])
+
+
 def delete_from_cache(
     user_id: str,
     session_id: str,
