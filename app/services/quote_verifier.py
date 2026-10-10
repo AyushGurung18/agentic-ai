@@ -42,6 +42,7 @@ class VerifiedQuote:
     spans: list[QuoteSpan] = field(default_factory=list)   # every occurrence found
     case_mismatch: bool = False
     page: int | None = None             # page of the first occurrence, if page map available
+    page_end: int | None = None         # last page the first occurrence spans into, if different from `page`
 
 
 def _build_pattern(quote: str) -> "re.Pattern | None":
@@ -97,6 +98,11 @@ def verify_quote(quote: str, document_text: str, pages: list[dict] | None = None
     spans = [QuoteSpan(m.start(), m.end()) for m in matches]
     verbatim = document_text[spans[0].start:spans[0].end]
     page = locate_page(spans[0].start, pages) if pages else None
+    # end - 1: char_end is exclusive, so the span's last actual character is
+    # one before it — using char_end itself would attribute a quote that
+    # ends exactly on a page boundary to the page AFTER it, when every
+    # character of the quote is actually on the earlier page.
+    page_end = locate_page(spans[0].end - 1, pages) if pages else None
 
     return VerifiedQuote(
         quote=verbatim,
@@ -104,6 +110,7 @@ def verify_quote(quote: str, document_text: str, pages: list[dict] | None = None
         spans=spans,
         case_mismatch=case_mismatch,
         page=page,
+        page_end=page_end if page_end != page else None,
     )
 
 
