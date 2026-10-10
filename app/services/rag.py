@@ -3,7 +3,7 @@ app/services/rag.py
 ────────────────────
 Conversational RAG entry points wired to:
   • LangGraph Self-RAG + CRAG graph  (langgraph_rag.py)
-  • Groq / Gemini / NVIDIA / self-hosted vLLM LLMs
+  • Groq / Gemini / OpenRouter / self-hosted vLLM LLMs
   • PGVector + HNSW for similarity retrieval
   • Normalized messages table for chat history  (via history.py)
   • Normalized documents / chunks / embeddings tables (via document_service.py)
@@ -23,7 +23,6 @@ import concurrent.futures
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
@@ -37,8 +36,9 @@ langchain.debug = False  # set True only when actively debugging chains
 # single stuck provider blocks the fallback from ever being tried. This
 # wraps any LLM in a hard, externally-enforced wall-clock cutoff so a
 # stuck call is abandoned (not waited on) and the next provider in the
-# .with_fallbacks() chain runs instead — independent of whatever timeout
-# behavior (or lack of one) that provider's own client library has.
+# fallback chain (_llm_with_fallbacks, below) runs instead — independent
+# of whatever timeout behavior (or lack of one) that provider's own
+# client library has.
 _TIMEOUT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-timeout")
 
 # Per-provider hard cutoff. Was 12s — measured OpenRouter's free auto-router
@@ -67,6 +67,29 @@ def _with_hard_timeout(llm, seconds: float, name: str):
             raise TimeoutError(f"{name} did not respond within {seconds}s")
     return RunnableLambda(_invoke, name=f"{name}_bounded")
 
+
+def _llm_with_fallbacks(named_candidates: list[tuple[str, RunnableLambda]]) -> RunnableLambda:
+    """Try each (name, bounded LLM runnable) in order; first success wins.
+
+    Deliberately NOT LangChain's built-in .with_fallbacks(): when every
+    candidate fails, that raises only the FIRST provider's exception. That
+    bit us directly — a permanently dead primary model (HTTP 410) kept
+    surfacing as "the" error on every request while silently hiding
+    whatever was actually wrong with the providers behind it, making the
+    real failure undiagnosable from the user-visible error alone. This
+    collects every candidate's error and raises all of them together only
+    if all of them fail.
+    """
+    def _invoke(input, config=None, **kwargs):
+        errors: list[str] = []
+        for name, llm in named_candidates:
+            try:
+                return llm.invoke(input, config=config, **kwargs)
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+        raise RuntimeError("All providers failed — " + " | ".join(errors))
+    return RunnableLambda(_invoke, name="llm_with_fallbacks")
+
 from app.services.chunking import hierarchical_chunk_text
 from app.services.document_service import (
     ingest_document, ensure_session, ensure_user, get_session_document_ids, get_documents_by_ids,
@@ -81,7 +104,7 @@ import json as _json
 from app.core.config import (
     CHUNK_SIZE, CHUNK_OVERLAP,
     VLLM_BASE_URL, VLLM_MODEL, VLLM_API_KEY,
-    GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY,
+    GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY,
     GROQ_API_KEY_2, GEMINI_API_KEY_2,
     DEV_USER_ID, DEV_USER_EMAIL,
 )
@@ -198,10 +221,12 @@ def get_llm_by_intent(intent: str):
     that compounded into multi-minute hangs and "origin_timeout" errors
     at the edge — the timeout itself was never really the problem.
 
-    LangChain's .with_fallbacks() tries every configured provider in
+    _llm_with_fallbacks() (below) tries every configured provider in
     priority order within a single invoke() call, moving to the next one
     immediately on any failure instead of retrying the one that just
-    failed.
+    failed. (Not LangChain's built-in .with_fallbacks() — it only ever
+    surfaces the first provider's error when all fail, which hid real
+    failures behind whichever provider happened to be listed first.)
     """
     # The FIRST Groq/Gemini accounts are broken (org-restricted / quota-
     # exhausted, account-level — confirmed by testing every model
@@ -232,8 +257,14 @@ def get_llm_by_intent(intent: str):
     else:
         temperature = 0.2
         candidates = []
-        if NVIDIA_API_KEY:
-            candidates.append(("Nvidia Llama 3.1 70B", ChatNVIDIA(model="meta/llama-3.1-70b-instruct", nvidia_api_key=NVIDIA_API_KEY, temperature=temperature)))
+        # Nvidia's "meta/llama-3.1-70b-instruct" was dropped here on
+        # 2026-10-10 — confirmed permanently dead (HTTP 410 Gone, "reached
+        # its end of life on 2026-08-26"), not transient. As the first
+        # candidate it was unconditionally eating PROVIDER_TIMEOUT_S on
+        # every single non-cheap request before falling through, and because
+        # LangChain's .with_fallbacks() surfaces only the FIRST error when
+        # every candidate fails, it was also masking whatever was actually
+        # wrong with every fallback behind it (see _llm_with_fallbacks below).
         if GROQ_API_KEY_2:
             candidates.append(("Groq #2 Llama 3.3 70B", ChatGroq(model_name="llama-3.3-70b-versatile", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY_2:
@@ -256,9 +287,8 @@ def get_llm_by_intent(intent: str):
     # Every candidate gets the hard external timeout regardless of whether
     # it also has a native one set above — ChatNVIDIA has no native timeout
     # parameter at all, so this is the only thing bounding it.
-    bounded = [_with_hard_timeout(llm, PROVIDER_TIMEOUT_S, name) for name, llm in candidates]
-    primary, fallbacks = bounded[0], bounded[1:]
-    return primary.with_fallbacks(fallbacks) if fallbacks else primary
+    bounded = [(name, _with_hard_timeout(llm, PROVIDER_TIMEOUT_S, name)) for name, llm in candidates]
+    return _llm_with_fallbacks(bounded)
 
 
 # ── Document ingestion (unchanged — also called by Celery worker) ──────────────
