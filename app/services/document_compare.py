@@ -51,6 +51,20 @@ def _segments(text: str) -> list[str]:
     return [line.strip() for line in text.split("\n") if line.strip()]
 
 
+def _normalize_text(text: str) -> str:
+    """Collapse mid-sentence newlines that PDF extractors introduce.
+    PyMuPDF inserts a \\n at every visual line break, even inside a
+    continuous sentence. This cleans the text for display and diffing.
+    """
+    import re
+    # Replace single newlines that are NOT followed by a capital letter
+    # (which would mark a true paragraph/heading start) with a space.
+    text = re.sub(r'(?<!\n)\n(?!\n)(?![A-Z0-9\-•])', ' ', text)
+    # Collapse multiple spaces and normalize paragraph breaks
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
+
+
 def _classify_changes(pairs: list[dict], llm) -> list[dict]:
     """One batched LLM call grading every changed-paragraph pair at once —
     same reasoning as grade_documents() in langgraph_rag.py: N separate
@@ -102,14 +116,66 @@ def _classify_changes(pairs: list[dict], llm) -> list[dict]:
     return results
 
 
+def _compute_similarity(text_a: str, text_b: str) -> float:
+    """Fast bag-of-words Jaccard similarity between two document texts.
+    Used to gate comparison — unrelated documents produce meaningless
+    difflib output (everything shows as 'replaced') and should be blocked.
+    Returns a float 0.0–1.0.
+    """
+    import re
+    def tokenize(t: str) -> set:
+        return set(re.findall(r'\b[a-z]{3,}\b', t.lower()))
+    
+    words_a = tokenize(text_a)
+    words_b = tokenize(text_b)
+    if not words_a or not words_b:
+        return 0.0
+    intersection = len(words_a & words_b)
+    union = len(words_a | words_b)
+    return intersection / union if union else 0.0
+
+
 def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str, llm) -> dict:
     """
-    Returns {"changes": [...]} — each change:
-      {type: "added"|"removed"|"modified", before, after, summary, significance}
-    sorted major → minor so the most substantive changes surface first.
+    Returns {"changes": [...], "similarity_score": float, "relatedness": str}
+    
+    Similarity gates:
+      < 0.05  → documents are unrelated, comparison blocked
+      0.05–0.18 → documents partially related, comparison proceeds with warning
+      > 0.18  → documents sufficiently similar, full comparison
+    
+    Each change: {type, before, after, summary, significance}
+    Sorted major → minor so most substantive changes surface first.
     """
-    paras_a = _segments(text_a)
-    paras_b = _segments(text_b)
+    # ── Pre-flight: semantic relatedness check ────────────────────────────────
+    similarity = _compute_similarity(text_a, text_b)
+    logger.info("[compare] Jaccard similarity %s vs %s = %.3f", filename_a, filename_b, similarity)
+    
+    if similarity < 0.05:
+        # Completely unrelated — difflib would produce 100% false positives
+        return {
+            "document_a": filename_a,
+            "document_b": filename_b,
+            "total_segments_a": 0,
+            "total_segments_b": 0,
+            "similarity_score": round(similarity, 3),
+            "relatedness": "unrelated",
+            "changes": [],
+            "error": (
+                f"These documents don't appear to be related — they share fewer than 5% of "
+                f"vocabulary ({round(similarity * 100, 1)}% overlap). Comparing them would produce meaningless results. "
+                f"Compare documents that are versions of the same text, or documents from the same domain."
+            ),
+        }
+    
+    relatedness = "partial" if similarity < 0.18 else "related"
+    
+    # ── Normalize text before splitting (collapse PDF mid-line breaks) ────────
+    text_a_clean = _normalize_text(text_a)
+    text_b_clean = _normalize_text(text_b)
+    
+    paras_a = _segments(text_a_clean)
+    paras_b = _segments(text_b_clean)
 
     matcher = difflib.SequenceMatcher(None, paras_a, paras_b, autojunk=False)
     opcodes = matcher.get_opcodes()
@@ -122,8 +188,6 @@ def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str
         if tag == "equal":
             continue
         if tag == "replace":
-            # Pair up 1:1 as far as both sides go; leftover on the longer
-            # side becomes its own added/removed entries.
             before_block = paras_a[i1:i2]
             after_block = paras_b[j1:j2]
             for k in range(max(len(before_block), len(after_block))):
@@ -148,8 +212,6 @@ def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str
                 changes.append({"type": "removed", "before": before, "after": "",
                                  "summary": "Clause removed.", "significance": "moderate"})
 
-    # Grade the true modifications (added/removed get a generic label above —
-    # presence/absence is already the substantive signal there).
     try:
         graded = _classify_changes(modified_pairs, llm)
         for idx, g in zip(modified_indices, graded):
@@ -169,5 +231,7 @@ def compare_documents(text_a: str, filename_a: str, text_b: str, filename_b: str
         "document_b": filename_b,
         "total_segments_a": len(paras_a),
         "total_segments_b": len(paras_b),
+        "similarity_score": round(similarity, 3),
+        "relatedness": relatedness,
         "changes": changes,
     }
