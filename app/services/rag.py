@@ -208,8 +208,23 @@ def _get_openrouter_llm(temperature: float) -> ChatOpenAI:
     )
 
 
-def get_llm_by_intent(intent: str):
+def get_llm_by_intent(intent: str, exclude_groq: bool = False):
     """Returns an LLM with automatic cross-provider fallback baked in.
+
+    exclude_groq: set by the Part C agentic research path (see
+    run_agent_research below). Groq's openai/gpt-oss-* models have a
+    confirmed Groq-side bug (acknowledged by Groq staff on their own
+    community forum) where the model spontaneously attempts a *native*
+    tool call even when the request declares no tools at all — Groq's API
+    then 400s with "Tool choice is none, but model called a tool" instead
+    of just returning the text. This app's agentic loop never uses native
+    tool-calling (see agent_research.py's module docstring for why: a
+    hand-rolled TOOL_CALL/FINAL_ANSWER text protocol instead, for
+    cross-provider consistency) — but the agentic prompt describes tools
+    in plain text, which is apparently enough to trigger gpt-oss's
+    tool-calling training reflex anyway. Standard chat's prompt never
+    mentions tools, so it doesn't hit this — only the agentic path needs
+    Groq skipped.
 
     Previously this picked exactly one provider (whichever key was
     configured first) and invoke_with_retry() would retry ONLY that same
@@ -272,7 +287,7 @@ def get_llm_by_intent(intent: str):
     if intent == "cheap":
         temperature = 0.1
         candidates = []
-        if GROQ_API_KEY_2:
+        if GROQ_API_KEY_2 and not exclude_groq:
             candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
@@ -282,7 +297,7 @@ def get_llm_by_intent(intent: str):
             candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
-        if GROQ_API_KEY:
+        if GROQ_API_KEY and not exclude_groq:
             candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
     else:
         temperature = 0.2
@@ -307,7 +322,7 @@ def get_llm_by_intent(intent: str):
         # model from emitting the reasoning channel into the response at
         # all, which is all this app's hand-rolled TOOL_CALL/FINAL_ANSWER
         # text protocol needs from it anyway.
-        if GROQ_API_KEY_2:
+        if GROQ_API_KEY_2 and not exclude_groq:
             candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
@@ -317,7 +332,7 @@ def get_llm_by_intent(intent: str):
             candidates.append(("OpenRouter (free) #1", _get_openrouter_llm(temperature=temperature)))
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
-        if GROQ_API_KEY:
+        if GROQ_API_KEY and not exclude_groq:
             candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
@@ -444,17 +459,20 @@ def ask_question(
     except Exception as exc:
         logger.warning("[history] Failed to save user message: %s", exc)
 
-    # Route intent to determine which model to use
-    intent = route_intent(question)
-    llm = get_llm_by_intent(intent)
-
     document_ids = get_session_document_ids(session_id)
-
-    logger.info("[RAG] mode=%s intent=%s user=%s session=%s docs=%d q=%s", mode, intent, user_id, session_id, len(document_ids), question[:80])
-
     agentic = mode == "agentic" and len(document_ids) == 1
     if mode == "agentic" and len(document_ids) != 1:
         logger.info("[RAG] Agentic mode requested but session has %d documents (needs exactly 1) — falling back to standard.", len(document_ids))
+
+    # Route intent to determine which model to use. exclude_groq=agentic:
+    # see get_llm_by_intent()'s docstring — Groq's gpt-oss models have a
+    # confirmed Groq-side bug where they spontaneously attempt a native
+    # tool call against the agentic path's tool-describing prompt, which
+    # standard chat's prompt never triggers.
+    intent = route_intent(question)
+    llm = get_llm_by_intent(intent, exclude_groq=agentic)
+
+    logger.info("[RAG] mode=%s intent=%s user=%s session=%s docs=%d q=%s", mode, intent, user_id, session_id, len(document_ids), question[:80])
 
     full_answer = ""
     doc_refs: dict[int, DocRef] = {}
