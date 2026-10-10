@@ -273,7 +273,7 @@ def get_llm_by_intent(intent: str):
         temperature = 0.1
         candidates = []
         if GROQ_API_KEY_2:
-            candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #2 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Flash", ChatGoogleGenerativeAI(model="gemini-flash-latest", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY:
@@ -283,7 +283,7 @@ def get_llm_by_intent(intent: str):
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
-            candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #1 GPT-OSS 20B", ChatGroq(model_name="openai/gpt-oss-20b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
     else:
         temperature = 0.2
         candidates = []
@@ -295,8 +295,20 @@ def get_llm_by_intent(intent: str):
         # LangChain's .with_fallbacks() surfaces only the FIRST error when
         # every candidate fails, it was also masking whatever was actually
         # wrong with every fallback behind it (see _llm_with_fallbacks below).
+        #
+        # reasoning_format="hidden" on every ChatGroq instance below: the
+        # gpt-oss models are reasoning models that emit an internal
+        # chain-of-thought "analysis" channel by default. Groq's own API
+        # tries to separate that from the final answer server-side, and
+        # when the response is cut off mid-channel it 400s with
+        # output_parse_failed — observed live in agentic mode (which makes
+        # several back-to-back tool-calling turns per request, more likely
+        # to hit this than a single-turn chat answer). "hidden" stops the
+        # model from emitting the reasoning channel into the response at
+        # all, which is all this app's hand-rolled TOOL_CALL/FINAL_ANSWER
+        # text protocol needs from it anyway.
         if GROQ_API_KEY_2:
-            candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #2 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY_2, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
         if GEMINI_API_KEY_2:
             candidates.append(("Gemini #2 Pro", ChatGoogleGenerativeAI(model="gemini-3.1-pro-preview", google_api_key=GEMINI_API_KEY_2, temperature=temperature, timeout=PROVIDER_TIMEOUT_S)))
         if GEMINI_API_KEY:
@@ -306,7 +318,7 @@ def get_llm_by_intent(intent: str):
         if OPENROUTER_API_KEY:
             candidates.append(("OpenRouter (free) #2", _get_openrouter_llm(temperature=temperature)))
         if GROQ_API_KEY:
-            candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S)))
+            candidates.append(("Groq #1 GPT-OSS 120B", ChatGroq(model_name="openai/gpt-oss-120b", temperature=temperature, groq_api_key=GROQ_API_KEY, request_timeout=PROVIDER_TIMEOUT_S, reasoning_format="hidden")))
 
     # Self-hosted vLLM always closes out the chain — no API key, no rate limit.
     candidates.append(("Self-hosted vLLM", _get_vllm_llm(temperature=temperature)))
