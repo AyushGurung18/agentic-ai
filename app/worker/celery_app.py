@@ -15,8 +15,8 @@ Configuration notes:
                               so the job is never silently lost on worker crash
   • prefetch_multiplier=1   → worker only grabs 1 task at a time; important for
                               long-running PDF jobs that consume significant RAM
-  • task_time_limit=600     → hard kill after 10 min (handles runaway embedding)
-  • task_soft_time_limit=540→ raises SoftTimeLimitExceeded 60s before hard kill
+  • task_time_limit=780     → hard kill after 13 min (handles runaway embedding)
+  • task_soft_time_limit=720→ raises SoftTimeLimitExceeded 60s before hard kill
                               so the task can clean up and mark itself failed
 """
 
@@ -77,9 +77,13 @@ celery_app.conf.update(
     # container uptime on a small, memory-constrained host.
     worker_max_tasks_per_child=5,
 
-    # Timeouts — 100-page PDFs take ~2-4 min to embed on CPU
-    task_time_limit=600,        # hard kill at 10 min
-    task_soft_time_limit=540,   # graceful at 9 min
+    # Timeouts — 100-page PDFs take ~2-4 min to embed on CPU. The old DB-write
+    # step (one INSERT+RETURNING round trip per chunk/child/embedding row) was
+    # the real cost for large docs, not embedding — now batched via
+    # executemany() in document_service.ingest_document(), so these limits are
+    # mostly headroom for pathological inputs rather than the normal path.
+    task_time_limit=780,        # hard kill at 13 min
+    task_soft_time_limit=720,   # graceful at 12 min
 
     # Retry policy for transient broker blips
     broker_connection_retry_on_startup=True,

@@ -117,7 +117,7 @@ def ingest_document_task(
 
     except SoftTimeLimitExceeded:
         # Graceful timeout — mark failed so the client knows
-        _update_job(job_id, status="failed", error="Task timed out after 9 minutes.")
+        _update_job(job_id, status="failed", error="Task timed out after 12 minutes.")
         logger.error("[ingest_document_task] ⏱ Soft time limit exceeded for job_id=%s", job_id)
         raise  # Let Celery handle it
 

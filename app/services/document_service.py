@@ -113,46 +113,35 @@ def ingest_document(
                 )
 
             # ── 3. Insert chunks + embeddings ────────────────────────────────
+            # IDs are generated client-side (instead of relying on the table's
+            # gen_random_uuid() default + RETURNING) so every parent, child,
+            # and embedding row can go through a single executemany() each —
+            # 3 round trips total instead of up to 3 serial round trips *per
+            # child chunk* (each previously blocked on a RETURNING + fetchone()
+            # before the next INSERT could even be sent). For a 150-page
+            # document with hundreds of chunks that serial pattern was the
+            # actual cause of ingestion jobs blowing past the Celery
+            # soft_time_limit — this keeps the chunk count the pipeline can
+            # handle well above what any real contract will need.
             chunk_metadatas: list[dict] = []
+            parent_rows: list[tuple] = []
+            child_rows: list[tuple] = []
+            embedding_rows: list[tuple] = []
             global_chunk_idx = 0
-            
+
             for p in hierarchical_chunks:
-                # 3a. Insert Parent chunk (no embedding)
-                cur.execute(
-                    """
-                    INSERT INTO document_chunks (document_id, chunk_index, content)
-                    VALUES (%s::uuid, %s, %s)
-                    RETURNING id
-                    """,
-                    (document_id, global_chunk_idx, p["parent"]),
-                )
-                parent_id: str = str(cur.fetchone()[0])
+                parent_id = str(uuid.uuid4())
+                parent_rows.append((parent_id, document_id, global_chunk_idx, p["parent"]))
                 global_chunk_idx += 1
-                
-                # 3b. Insert Child chunks (with embedding)
+
                 for child_text in p["children"]:
-                    cur.execute(
-                        """
-                        INSERT INTO document_chunks (document_id, parent_chunk_id, chunk_index, content)
-                        VALUES (%s::uuid, %s::uuid, %s, %s)
-                        RETURNING id
-                        """,
-                        (document_id, parent_id, global_chunk_idx, child_text),
-                    )
-                    child_id: str = str(cur.fetchone()[0])
+                    child_id = str(uuid.uuid4())
+                    child_rows.append((child_id, document_id, parent_id, global_chunk_idx, child_text))
                     global_chunk_idx += 1
-                    
-                    # 3c. Insert embedding for child
+
                     vector = vectors[vector_idx]
                     vector_idx += 1
-                    
-                    cur.execute(
-                        """
-                        INSERT INTO embeddings (chunk_id, embedding)
-                        VALUES (%s::uuid, %s::vector)
-                        """,
-                        (child_id, str(vector)),
-                    )
+                    embedding_rows.append((child_id, str(vector)))
 
                     chunk_metadatas.append({
                         "chunk_id": child_id,
@@ -162,11 +151,36 @@ def ingest_document(
                         "filename": filename,
                         "user_id": user_id,
                     })
-                    
-                if progress_callback:
-                    # 50% to 100% for DB insertion
-                    # Calculate progress based on vectors inserted
-                    progress_callback(50 + int((vector_idx / total_chunks) * 50))
+
+            cur.executemany(
+                """
+                INSERT INTO document_chunks (id, document_id, chunk_index, content)
+                VALUES (%s::uuid, %s::uuid, %s, %s)
+                """,
+                parent_rows,
+            )
+            if progress_callback:
+                progress_callback(65)
+
+            cur.executemany(
+                """
+                INSERT INTO document_chunks (id, document_id, parent_chunk_id, chunk_index, content)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s)
+                """,
+                child_rows,
+            )
+            if progress_callback:
+                progress_callback(85)
+
+            cur.executemany(
+                """
+                INSERT INTO embeddings (chunk_id, embedding)
+                VALUES (%s::uuid, %s::vector)
+                """,
+                embedding_rows,
+            )
+            if progress_callback:
+                progress_callback(100)
 
             # ── 4. Insert metadata tags (optional) ──────────────────────────
             if metadata_tags:
