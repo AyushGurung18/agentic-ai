@@ -646,6 +646,7 @@ def get_session_messages(
                     role=m["role"],
                     content=m["content"],
                     created_at=m["created_at"],
+                    quotes=(m.get("metadata") or {}).get("quotes"),
                 )
                 for m in cached.get("messages", [])
             ]
@@ -667,7 +668,7 @@ def get_session_messages(
 
             cur.execute(
                 """
-                SELECT id, session_id, role, content, created_at
+                SELECT id, session_id, role, content, created_at, metadata
                 FROM   messages
                 WHERE  session_id = %s::uuid
                 ORDER  BY created_at ASC
@@ -684,12 +685,25 @@ def get_session_messages(
             title_row = cur.fetchone()
             session_title = title_row[0] if title_row else None
 
+    def _parse_metadata(raw):
+        # psycopg normally adapts jsonb -> dict automatically, but handle a
+        # raw string defensively too rather than assume the driver config.
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
     msgs_db = [
         {
             "id": row[0],
             "role": row[2],
             "content": row[3],
             "created_at": row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+            "metadata": _parse_metadata(row[5]),
         }
         for row in rows
     ]
@@ -710,6 +724,7 @@ def get_session_messages(
             role=m["role"],
             content=m["content"],
             created_at=m["created_at"],
+            quotes=(m.get("metadata") or {}).get("quotes"),
         )
         for m in msgs_db
     ]

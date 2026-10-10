@@ -51,6 +51,7 @@ class MessageResponse(BaseModel):
     role: str          # 'user' | 'assistant'
     content: str
     created_at: datetime
+    quotes: Optional[list[dict]] = None  # per-quote verification results, assistant messages only
 
 class MessageListResponse(BaseModel):
     messages: list[MessageResponse]

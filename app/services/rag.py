@@ -469,7 +469,7 @@ def ask_question(
     # streaming yield loop below — so a reload reflects the real exchange
     # even if the client disconnects mid-stream.
     try:
-        save_message(session_id, "assistant", full_answer)
+        save_message(session_id, "assistant", full_answer, metadata={"quotes": quote_meta} if quote_meta else None)
     except Exception as exc:
         logger.warning("[history] Failed to save assistant message: %s", exc)
 
@@ -505,6 +505,7 @@ def ask_question(
                     session_id=session_id,
                     question=question,
                     answer=full_answer,
+                    answer_metadata={"quotes": quote_meta} if quote_meta else None,
                 )
             except Exception as exc:
                 logger.warning("[HFCache] Post-response write failed: %s", exc)

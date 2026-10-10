@@ -34,6 +34,14 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at  TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Per-quote verification results (verified/unverified, document, page,
+-- char range) for an assistant message — e.g. {"quotes": [...]}. Without
+-- this, reopening a past conversation had no way to know which quotes were
+-- originally verified (that metadata only ever existed in the live SSE
+-- stream, never persisted), so every quote in a reloaded chat silently
+-- rendered as "unverified" regardless of its real, original status.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS metadata JSONB;
+
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
 
 -- 5. Documents

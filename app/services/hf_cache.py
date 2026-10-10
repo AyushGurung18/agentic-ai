@@ -204,6 +204,7 @@ def append_messages_to_cache(
     question: str,
     answer: str,
     title: str | None = None,
+    answer_metadata: dict | None = None,
 ) -> None:
     """
     Append a user+assistant message pair to the cached session file.
@@ -212,6 +213,11 @@ def append_messages_to_cache(
     If the file doesn't exist yet, it is created with just these two messages.
     IDs are assigned as len(existing)+1 / len(existing)+2 (local counter —
     the real BIGSERIAL id from Supabase is set on cold-miss repopulation).
+
+    `answer_metadata` (e.g. {"quotes": [...]}) mirrors the `metadata` column
+    written to the messages table — without it here too, a cache-hit reload
+    would show every quote as unverified even though the DB copy has the
+    real verification result, since the two paths would silently disagree.
     """
     # Try to find the existing file (auth or anon dir)
     existing: dict | None = None
@@ -251,6 +257,7 @@ def append_messages_to_cache(
         "role": "assistant",
         "content": answer,
         "created_at": now,
+        "metadata": answer_metadata,
     })
 
     existing["messages"] = msgs

@@ -16,6 +16,8 @@ Public API
     get_session_history(session_id) -> callable usable by RunnableWithMessageHistory
 """
 
+import json
+
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.chat_history import BaseChatMessageHistory
 from app.db.database import get_conn
@@ -54,20 +56,24 @@ def get_messages(session_id: str, limit: int = 10) -> list[BaseMessage]:
     return result
 
 
-def save_message(session_id: str, role: str, content: str) -> None:
+def save_message(session_id: str, role: str, content: str, metadata: dict | None = None) -> None:
     """
     Persist a single message to the `messages` table.
     `role` must be 'user' or 'assistant'.
+    `metadata` (assistant messages only, e.g. {"quotes": [...]}) is what lets
+    a reopened conversation show the same verified/unverified quote styling
+    it had live — that metadata is otherwise only ever sent once, over the
+    SSE stream, and never persisted anywhere else.
     """
     assert role in ("user", "assistant"), f"Invalid role: {role!r}"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO messages (session_id, role, content)
-                VALUES (%s::uuid, %s, %s)
+                INSERT INTO messages (session_id, role, content, metadata)
+                VALUES (%s::uuid, %s, %s, %s::jsonb)
                 """,
-                (session_id, role, content),
+                (session_id, role, content, json.dumps(metadata) if metadata else None),
             )
         conn.commit()
 
