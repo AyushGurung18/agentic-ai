@@ -38,6 +38,7 @@ def upload_file_stream_to_r2(file_obj, filename: str, content_type: str = "appli
             object_key,
             ExtraArgs={'ContentType': content_type}
         )
+        file_obj.seek(0)
     except (BotoCoreError, ClientError) as e:
         print(f"Failed to upload to R2: {e}")
         # In a production app, we might want to log this or handle it,
