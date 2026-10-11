@@ -347,6 +347,37 @@ def ask(
     return StreamingResponse(response_stream, media_type="text/plain")
 
 
+class AnonymizeRequest(BaseModel):
+    text: str
+
+
+class DeanonymizeRequest(BaseModel):
+    text: str
+    mapping: dict[str, str]
+
+
+@router.post("/anonymize")
+def anonymize_text(body: AnonymizeRequest):
+    """Reversibly anonymizes PII (names, emails, phones, tax IDs, orgs) in contract text."""
+    from app.services.anonymizer import anonymizer
+    anon_text, mapping, entities = anonymizer.anonymize(body.text)
+    return {
+        "anonymized_text": anon_text,
+        "mapping": mapping,
+        "entities": entities
+    }
+
+
+@router.post("/deanonymize")
+def deanonymize_text(body: DeanonymizeRequest):
+    """Restores placeholders to original entity values using reversible mapping."""
+    from app.services.anonymizer import anonymizer
+    restored = anonymizer.deanonymize(body.text, body.mapping)
+    return {
+        "original_text": restored
+    }
+
+
 class ChatRequest(BaseModel):
     q: str
     session_id: str = "00000000-0000-0000-0000-000000000000"
@@ -355,6 +386,7 @@ class ChatRequest(BaseModel):
     # one attached document — ask_question() falls back to "standard"
     # otherwise rather than erroring.
     mode: str = "standard"
+    anonymize: bool = False
 
 
 @router.post("/chat")
@@ -366,9 +398,14 @@ def chat(
     if not body.q.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    query_text = body.q
+    if body.anonymize:
+        from app.services.anonymizer import anonymizer
+        query_text, _, _ = anonymizer.anonymize(query_text)
+
     ensure_user(user_id, email=f"anon-{user_id}@thotqen.internal")
     response_stream = ask_question(
-        body.q, body.session_id, user_id=user_id, mode=body.mode,
+        query_text, body.session_id, user_id=user_id, mode=body.mode,
     )
     return StreamingResponse(response_stream, media_type="text/plain")
 

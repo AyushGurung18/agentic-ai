@@ -26,7 +26,7 @@ ARCH_OVERVIEW = """
 flowchart LR
     subgraph Frontend["Frontend · bbygrl (Next.js)"]
         direction TB
-        UI["Contract Workspace UI\\nSupabase Auth"]
+        UI["Contract Workspace UI\\nVoice Input · RTL Arabic Detection\\nExport (.md) · Supabase Auth"]
         DocViewer["Synced Document Viewer\\nPDF / DOCX + Citation Highlighting"]
         DiffUI["Document Version Comparator\\nParagraph Diffs + Significance Badges"]
     end
@@ -99,7 +99,7 @@ flowchart LR
 # ── Diagram 2: Query Pipeline Detail ────────────────────────────────────────────
 PIPELINE_DETAIL = """
 flowchart TD
-    START(["User Question\\n+ attached document(s)"])
+    START(["User Question\\nVoice Speech or Text + attached document(s)"])
     INTENT{"route_intent\\nfast LLM call:\\ncheap or complex?\\nagentic mode on?"}
 
     START --> INTENT
@@ -145,7 +145,7 @@ flowchart TD
     end
 
     VERIFY["quote_verifier.py\\nWhitespace-tolerant regex per quote\\nChar offset + page span location\\nUnverified quotes flagged, not hidden"]
-    VERIFY --> STREAM["SSE stream to client\\nAnnotated answer + verified quote spans\\n+ tool call status events (agentic)"]
+    VERIFY --> STREAM["SSE Stream & Export\\nAnnotated answer + verified quote spans\\n+ tool call status events\\n+ Markdown export & audio read-aloud"]
 """
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ Next.js Client
 flowchart LR
     subgraph Frontend["Frontend · bbygrl (Next.js)"]
         direction TB
-        UI["Contract Workspace UI\nSupabase Auth"]
+        UI["Contract Workspace UI\nVoice Input · RTL Arabic Detection\nExport (.md) · Supabase Auth"]
         DocViewer["Synced Document Viewer\nPDF / DOCX + Citation Highlighting"]
         DiffUI["Document Version Comparator\nParagraph Diffs + Significance Badges"]
     end

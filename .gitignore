@@ -1,8 +1,15 @@
 .env
 env
+venv/
+.venv/
 app/services/__pycache__
+app/__pycache__/
 __pycache__/
 *.pyc
 tmp_hf/
 testset.csv
 evaluation_results.csv
+log.txt
+*.log
+/automated-ray-*.json
+/image.png
