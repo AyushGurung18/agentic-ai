@@ -41,6 +41,7 @@ applies here identically, via the same QUOTE_MARK protocol generate() uses.
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
@@ -275,6 +276,41 @@ def _build_messages(question: str, scratchpad: list[tuple[str, str]], doc: Docum
     return messages
 
 
+def _run_with_heartbeat(fn, *args, heartbeat_s: float = 15.0, label: str = "Still thinking..."):
+    """Runs a blocking call on a background thread, yielding a 'status'
+    event every `heartbeat_s` seconds while it's in flight, then a final
+    {"type": "_result", ...} event carrying the return value (or raising
+    the original exception if `fn` failed).
+
+    Without this, a single `_ask()` call can silently block for 100+
+    seconds — the LLM fallback chain tries each provider in sequence
+    (Gemini #2, Gemini #1, OpenRouter #1, OpenRouter #2, ...), each with
+    its own ~40s timeout, before the loop yields anything at all. That
+    silent gap is long enough to trip the edge proxy's idle-connection
+    timeout (confirmed live: HTTP 524 from Cloudflare) well before the
+    LLM call itself would ever time out — the fix isn't a faster LLM
+    call, it's making sure *some* bytes keep flowing on the stream.
+    """
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["value"] = fn(*args)
+        except Exception as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        thread.join(timeout=heartbeat_s)
+        if thread.is_alive():
+            yield {"type": "status", "label": label}
+
+    if "error" in box:
+        raise box["error"]
+    yield {"type": "_result", "value": box.get("value")}
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 @traceable(name="agent_research_loop", run_type="chain")
@@ -296,9 +332,25 @@ def run_agent_research(question: str, doc: DocumentRef, llm):
         runnable = RunnableLambda(lambda _: llm.invoke(messages)) | parser
         return invoke_with_retry(runnable, {})
 
+    def _ask_streaming(messages: list[BaseMessage]):
+        # Wraps _ask() with _run_with_heartbeat so the SSE stream keeps
+        # emitting bytes during a slow/multi-provider-fallback LLM call
+        # instead of going silent long enough to trip the edge proxy's
+        # idle-connection timeout. `yield from` here surfaces the
+        # heartbeat 'status' events to the outer generator's consumer
+        # while its return value (Python 3 StopIteration.value) carries
+        # the actual answer back to the caller below.
+        box: dict = {}
+        for ev in _run_with_heartbeat(_ask, messages, label="Still thinking..."):
+            if ev["type"] == "_result":
+                box["raw"] = ev["value"]
+            else:
+                yield ev
+        return box["raw"]
+
     for round_i in range(MAX_ROUNDS):
         messages = _build_messages(question, scratchpad, doc, calls_made)
-        raw = _ask(messages)
+        raw = yield from _ask_streaming(messages)
         action = parse_agent_action(raw)
 
         if action.kind == "final":
@@ -329,7 +381,7 @@ def run_agent_research(question: str, doc: DocumentRef, llm):
         "You've used all available tool calls. Respond now with FINAL_ANSWER: based on what you found.",
     ))
     messages = _build_messages(question, scratchpad, doc, calls_made)
-    raw = _ask(messages)
+    raw = yield from _ask_streaming(messages)
     action = parse_agent_action(raw)
     if action.kind == "final":
         answer = action.text
