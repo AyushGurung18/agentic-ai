@@ -38,7 +38,11 @@ def upload_file_stream_to_r2(file_obj, filename: str, content_type: str = "appli
             object_key,
             ExtraArgs={'ContentType': content_type}
         )
-        file_obj.seek(0)
+        # No seek(0) here: upload_fileobj() closes file_obj once the transfer
+        # completes (confirmed live — "I/O operation on closed file" on every
+        # upload), and the sole caller already passes a disposable,
+        # single-use BytesIO it never reads again, so there's nothing to
+        # reset for.
     except (BotoCoreError, ClientError) as e:
         print(f"Failed to upload to R2: {e}")
         # In a production app, we might want to log this or handle it,
