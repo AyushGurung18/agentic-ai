@@ -87,7 +87,7 @@ class JobStatusResponse(BaseModel):
 
 @router.post("/upload", response_model=UploadJobResponse)
 async def upload(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     session_id: Optional[str] = Query(None, description="Attach doc to this session."),
     user_id: str = Depends(get_current_user_id),
 ):
@@ -105,6 +105,11 @@ async def upload(
     text is then handed to Celery, which does chunking + embedding in the
     worker process, keeping the API process lightweight.
     """
+    if file is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No file was received. Attach a PDF or DOCX and try again.",
+        )
     filename = file.filename or ""
     ext = next((e for e in ACCEPTED_EXTENSIONS if filename.lower().endswith(e)), None)
     if not ext:
